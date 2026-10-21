@@ -56,7 +56,7 @@ EXCLUDES="${EXCLUDES:-$BASE/exclude.txt}"
 # of "undo a bad prune". This is a different axis from restic's own forget policy.
 KEEP_SNAPSHOTS="${KEEP_SNAPSHOTS:-8}"
 SNAPSHOT_RETENTION_DAYS="${SNAPSHOT_RETENTION_DAYS:-$((KEEP_SNAPSHOTS * 7))}"
-SNAPSHOT_MAX_AGE=$((6 * 3600))
+SNAPSHOT_MAX_AGE="${SNAPSHOT_MAX_AGE:-$((6 * 3600))}"
 
 MAX_SOURCE_GB="${MAX_SOURCE_GB:-45}"
 EXPECTED_MIN_CONTAINERS="${EXPECTED_MIN_CONTAINERS:-60}"
@@ -362,15 +362,22 @@ do_dumps() {
     rm -f "$tmp"
   done
 
-  # A new database nobody added to the list is a silent hole in coverage. Fail on it.
-  local f known
+  # A new database nobody added to the list is a silent hole in coverage. Fail on
+  # it. NOTE: written as `if`, not `[[ ]] && known=1` - under `set -e` a failing
+  # AND-list as the last command in a loop body exits the shell silently, which
+  # would kill this phase with no message on the first non-matching entry.
+  local f known e
   while read -r f; do
     [[ -n $f ]] || continue
     known=0
-    for entry in "${SQLITE_DBS[@]}"; do
-      [[ ${entry%%|*} == "$f" ]] && known=1
+    for e in "${SQLITE_DBS[@]}"; do
+      if [[ ${e%%|*} == "$f" ]]; then
+        known=1
+      fi
     done
-    (( known )) || die "undiscovered SQLite >10M: ${f} — add it to SQLITE_DBS"
+    if (( ! known )); then
+      die "undiscovered SQLite >10M: ${f} — add it to SQLITE_DBS"
+    fi
   done < <(find /srv -xdev -type f -name '*.db' -size +10M \
              -not -path "$STAGE/*" -not -path "$BASE/*" 2>/dev/null || true)
 

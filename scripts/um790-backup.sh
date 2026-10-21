@@ -1,4 +1,5 @@
-#!/usr/bin/env bash# um790-backup — phase runner. ONE phase per invocation; Dagu or a human sequences
+#!/usr/bin/env bash
+# um790-backup — phase runner. ONE phase per invocation; Dagu or a human sequences
 # the phases. Everything here is safe to run by hand during an incident, which is
 # deliberate: the guards that matter must not live only inside a scheduler.
 #
@@ -72,8 +73,7 @@ EXCLUDES="${EXCLUDES:-$BASE/exclude.txt}"
 #
 # The number that has to be right is the DURATION, so the duration is what is
 # configured. A cadence change now moves the snapshot count (cost) instead of the
-# safety margin (the thing you find out about when you need it). Leave the DAG on
-# a weekly schedule and you neither pay more nor keep less.
+# safety margin (the thing you find out about when you need it).
 #
 # Scope: this governs the NAS-side Btrfs snapshots that `prune` sweeps. It is a
 # separate axis from restic's own --keep-daily/--keep-weekly policy inside the
@@ -552,8 +552,8 @@ do_prune() {
   fi
   require_cmds restic ssh jq
 
-  # Guard 1: a fresh snapshot from THIS run. Prune is weekly, so a snapshot from a
-  # previous cycle is a full week stale and protects nothing that matters.
+  # Guard 1: a fresh snapshot from THIS run. A snapshot from a previous cycle is
+  # at least one full interval stale and protects nothing that matters.
   [[ -f $STATE/snapshot.epoch ]] \
     || die "no snapshot.epoch — the snapshot phase did not succeed; refusing to prune"
   local snap start age

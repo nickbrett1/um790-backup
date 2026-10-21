@@ -1,0 +1,606 @@
+#!/usr/bin/env bash
+#
+# agent-dev.sh - start, stop and inspect THIS devcontainer's own a2a-goose agent.
+#
+# Every generated devcontainer brings up and registers its own agent, named
+# "um790-backup-dev" (the repo name plus the "-dev" suffix).
+# ONE AGENT PER REPO IS THE CONTRACT: the registry row is keyed by that
+# name, so a `start` RECLAIMS the row a previous container left behind rather
+# than adding a second one - a stale "um790-backup-dev" is overwritten by
+# name, never duplicated.
+#
+# The agent is not baked into the image. The payload comes from the newest
+# a2a-goose GitHub Release, installed by nickbrett1/a2a-goose's own launcher
+# `fetch-launch.sh`, which lays itself down and self-updates on every start:
+#
+#   $DEPLOY_DIR/releases/<version>/   an unpacked payload; entry point bin/a2a-goose
+#   $DEPLOY_DIR/current -> releases/<version>
+#
+# A host that has never run the launcher is the one case the launcher cannot fix
+# for itself, so this script puts the first copy down (see cold_start) and then
+# runs it, backgrounded, with its output in the state log.
+#
+# FAIL OPEN IS THE FIRST RULE. A project is still usable without an agent, so a
+# first start with no network prints loudly that the agent did not start and
+# why, and exits 0. It never leaves the devcontainer unusable.
+#
+# Secrets are never baked in and never go on a command line: they live in
+# $ENV_FILE (mode 0600), sourced by the launcher with `set -a`. Doppler is the
+# source of truth for them.
+#
+# Subcommands:
+#   scripts/agent-dev.sh start    write env + config, fetch the launcher, run it
+#   scripts/agent-dev.sh stop     SIGTERM, wait for a clean shutdown, confirm gone
+#   scripts/agent-dev.sh status   running or not, the card URL, a log tail
+#
+# Run `scripts/agent-dev.sh help` for the post-start hook to wire it into the
+# devcontainer.
+set -uo pipefail # deliberately no -e: a first start with no network exits 0
+
+PROJECT_NAME="um790-backup"
+AGENT_NAME="um790-backup-dev"
+WORKSPACE="/workspaces/um790-backup"
+REPO_SLUG="nickbrett1/a2a-goose"
+
+DEPLOY_DIR="${DEPLOY_DIR:-${HOME}/.local/share/a2a-goose}"
+CONFIG_DIR="${HOME}/.config/a2a-goose"
+# The agent reads its config from $A2A_GOOSE_CONFIG; the default it would use is
+# exactly the path written below, so either spelling lands on the same file.
+CONFIG_FILE="${A2A_GOOSE_CONFIG:-${CONFIG_DIR}/config.yaml}"
+ENV_FILE="${ENV_FILE:-${CONFIG_DIR}/env}"
+STATE_DIR="${HOME}/.local/state/a2a-goose"
+LOG_FILE="${STATE_DIR}/agent.log"
+PID_FILE="${STATE_DIR}/agent.pid"
+
+LAUNCHER="${DEPLOY_DIR}/fetch-launch.sh"
+LAUNCHER_URL="https://github.com/${REPO_SLUG}/releases/latest/download/fetch-launch.sh"
+MANIFEST_URL="${MANIFEST_URL:-https://github.com/${REPO_SLUG}/releases/latest/download/manifest.json}"
+TIMEOUT="${TIMEOUT:-10}"
+
+# Where a secret the repo's own config does not define is looked for: the shared
+# Doppler project every container can read. Both are overridable so a host can
+# point at a different one without editing this file.
+COMMON_PROJECT="${A2A_GOOSE_COMMON_PROJECT:-common}"
+COMMON_CONFIG="${A2A_GOOSE_COMMON_CONFIG:-prd}"
+
+CARD_PORT=10001
+ACP_URL="http://127.0.0.1:3284/acp"
+
+# The central hub ("roost") this agent registers with over a websocket tunnel,
+# so it appears in the fleet. A `hub:` block is emitted only when it is enabled
+# AND a URL is set: an EMPTY HUB_URL must mean "no hub block at all", never a
+# block with a blank url that the client would refuse to dial. Setting
+# A2A_GOOSE_HUB_ENABLED=false is how a devcontainer opts out of the fleet. The
+# default host `nas` is the same one LITELLM_BASE_URL already resolves against.
+HUB_URL="${A2A_GOOSE_HUB_URL:-ws://nas:3008/agent/ws}"
+HUB_ENABLED="${A2A_GOOSE_HUB_ENABLED:-true}"
+
+# The address the card advertises MUST NOT be loopback - the agent refuses to
+# start on one - and it must be an address the LITELLM PROXY can resolve,
+# because the proxy is the process that dials it, not this container. A Tailscale
+# NAME does not survive that test: resolving one needs MagicDNS, which the
+# proxy's host may not run. Measured on the NAS, 2026-09-18: from that host,
+# http://genproj.tail86fd19.ts.net:10001 -> "Could not resolve host", while
+# http://100.72.205.65:10001 -> HTTP 200. A LiteLLM that cannot resolve the card
+# URL registers the agent and then fails every call to it with -32603.
+#
+# So the default is the container's own tailnet IPv4, and an address set in the
+# environment wins over it. A2A_GOOSE_TAILNET_NAME is the spelling this used
+# before the address became an IP; it is still read so a script seeded earlier
+# keeps working.
+CARD_ADDRESS="${A2A_GOOSE_CARD_ADDRESS:-${A2A_GOOSE_TAILNET_NAME:-}}"
+
+log() {
+  printf '%s agent-dev[%s]: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$$" "$*" >&2
+}
+
+# A visible, multi-line warning. Reserved for the things a human has to read.
+loud() {
+  printf '\n============================================================\n' >&2
+  for line in "$@"; do printf '  %s\n' "$line" >&2; done
+  printf '============================================================\n\n' >&2
+}
+
+usage() {
+  cat >&2 <<'USAGE'
+agent-dev.sh - start, stop and inspect this devcontainer's own a2a-goose agent.
+
+  scripts/agent-dev.sh start    write env + config, fetch the launcher, run it
+  scripts/agent-dev.sh stop     SIGTERM, wait for a clean shutdown, confirm gone
+  scripts/agent-dev.sh status   running or not, the card URL, a log tail
+
+Environment passthrough:
+  DEPLOY_DIR         default: $HOME/.local/share/a2a-goose
+  ENV_FILE           default: $HOME/.config/a2a-goose/env  (sourced with set -a)
+  MANIFEST_URL       default: the a2a-goose release manifest
+  TIMEOUT            default: 10 (seconds per HTTP request)
+  NO_FETCH=1         skip the fetch and start what is installed
+  A2A_GOOSE_CARD_ADDRESS  default: this container's tailnet IPv4 (the address the
+                     card advertises; it must be one the LiteLLM proxy can
+                     resolve, so an IP unless the proxy runs MagicDNS)
+  A2A_GOOSE_HUB_URL  default: ws://nas:3008/agent/ws - the hub (roost) this
+                     agent registers with over a websocket tunnel. An empty
+                     value means no hub block is written at all.
+  A2A_GOOSE_HUB_ENABLED
+                     default: true - set to false to opt this devcontainer out
+                     of the fleet (no hub block is written)
+  A2A_GOOSE_PROVIDER_PROJECT / _CONFIG
+                     default: goose/prd - where goose's own provider settings
+                     (GOOSE_PROVIDER, GOOSE_MODEL, the API key) are read from
+  GOOSE_DISABLE_KEYRING  default: 1 - there is no keyring in a container
+
+To start it automatically with the container, add this to
+.devcontainer/post-start-setup.sh:
+USAGE
+  cat <<'POST_START_HOOK'
+
+if [ -x "/workspaces/um790-backup/scripts/agent-dev.sh" ]; then
+  "/workspaces/um790-backup/scripts/agent-dev.sh" start >/dev/null 2>&1 || true
+fi
+POST_START_HOOK
+}
+
+# The address to advertise, resolved locally (no network needed). Fails rather
+# than falling back to something loopback, which the agent would refuse anyway:
+# a wrong publicUrl must not be written and then discovered as a startup refusal.
+#
+# This container's own tailnet IPv4 first - it is the one form every node that
+# can route here can dial - and the Tailscale name only if no address can be
+# had, since a name is useful exactly when the proxy runs MagicDNS.
+resolve_card_address() {
+  [ -n "${CARD_ADDRESS}" ] && return 0
+  command -v tailscale >/dev/null 2>&1 || return 1
+
+  local address
+  address="$(tailscale ip -4 2>/dev/null | head -1 || true)"
+  if [ -n "${address}" ]; then
+    CARD_ADDRESS="${address}"
+    return 0
+  fi
+
+  local json
+  json="$(tailscale status --json 2>/dev/null || true)"
+  [ -n "${json}" ] || return 1
+  if command -v jq >/dev/null 2>&1; then
+    address="$(printf '%s' "${json}" | jq -r '.Self.TailscaleIPs[0] // empty' 2>/dev/null || true)"
+    if [ -z "${address}" ]; then
+      address="$(printf '%s' "${json}" | jq -r '.Self.DNSName // empty' 2>/dev/null || true)"
+      address="${address%.}"
+    fi
+  else
+    # No jq: read this node's own entry. Cutting the document at "Peer" keeps a
+    # peer's address from being mistaken for ours; Self is emitted first.
+    local self
+    self="$(printf '%s' "${json}" | tr -d '\n' | sed 's/"Peer".*//')"
+    address="$(
+      printf '%s' "${self}" |
+        tr ',[]' '\n\n\n' |
+        sed -n 's/^[[:space:]]*"\([0-9]\{1,3\}\(\.[0-9]\{1,3\}\)\{3\}\)"[[:space:]]*$/\1/p' |
+        head -1
+    )"
+    if [ -z "${address}" ]; then
+      address="$(
+        printf '%s' "${self}" |
+          tr ',' '\n' |
+          sed -n 's/.*"DNSName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+          head -1
+      )"
+      address="${address%.}"
+    fi
+  fi
+
+  [ -n "${address}" ] || return 1
+  CARD_ADDRESS="${address}"
+  return 0
+}
+
+# goose does not only need the agent's secrets - it needs its OWN provider
+# settings, and this script is what starts its goose. The devcontainer's shell
+# reaches goose through a Doppler wrapper (`doppler run --project goose --config
+# prd -- goose`, see ~/.zshrc), which is where GOOSE_PROVIDER and the model come
+# from; the agent starts goose directly, so it reads the same project here rather
+# than inventing a second source. Without these the agent registers happily and
+# every turn fails with "Failed to resolve provider: Configuration value not
+# found: GOOSE_PROVIDER" - measured on genproj-dev, 2026-09-18.
+PROVIDER_PROJECT="${A2A_GOOSE_PROVIDER_PROJECT:-goose}"
+PROVIDER_CONFIG="${A2A_GOOSE_PROVIDER_CONFIG:-prd}"
+
+# One secret, straight out of Doppler. Empty on any failure (not logged in, no
+# network, key absent) so a caller can tell "no value" from "not fetched".
+read_secret() {
+  local key="$1" value=""
+  command -v doppler >/dev/null 2>&1 || {
+    printf ''
+    return 0
+  }
+  # The repo's own config first, so a repo that wants its own token wins; then
+  # the shared `common` project, which is where a token every container needs
+  # lives; then goose's own project, which is where the hub token
+  # (A2A_GOOSE_HUB_TOKEN) is kept. The fallbacks are the point: these are values
+  # every container needs the same copy of, so no repo has to carry its own.
+  value="$(doppler secrets get "${key}" --plain 2>/dev/null || true)"
+  if [ -z "${value}" ]; then
+    value="$(
+      doppler secrets get "${key}" --project "${COMMON_PROJECT}" --config "${COMMON_CONFIG}" --plain 2>/dev/null || true
+    )"
+  fi
+  if [ -z "${value}" ]; then
+    value="$(
+      doppler secrets get "${key}" --project "${PROVIDER_PROJECT}" --config "${PROVIDER_CONFIG}" --plain 2>/dev/null || true
+    )"
+  fi
+  printf '%s' "${value}"
+}
+
+# One of goose's own settings: the provider project first (the wrapper's source
+# of truth), then the same place the agent's secrets come from, so a repo that
+# carries its own goose provider still wins over the shared one.
+read_provider_secret() {
+  local key="$1" value=""
+  command -v doppler >/dev/null 2>&1 || {
+    printf ''
+    return 0
+  }
+  value="$(
+    doppler secrets get "${key}" --project "${PROVIDER_PROJECT}" --config "${PROVIDER_CONFIG}" --plain 2>/dev/null || true
+  )"
+  if [ -z "${value}" ]; then
+    value="$(read_secret "${key}")"
+  fi
+  printf '%s' "${value}"
+}
+
+# $ENV_FILE holds ONLY secrets, mode 0600, and is sourced by the launcher with
+# `set -a`. It is never carried on a command line and never placed in
+# `containerEnv`. A failed fetch keeps whatever is already there - it must not
+# overwrite a working file with emptiness.
+write_env_file() {
+  mkdir -p "${CONFIG_DIR}" || return 1
+  # Only fetched SECRETS count towards "did Doppler answer?". GOOSE_DISABLE_KEYRING
+  # below is a constant this script always adds, so it must not be what makes an
+  # empty fetch look like a successful one - that is the difference between
+  # keeping a working file and overwriting it with a stub.
+  local secrets="" key value
+  for key in A2A_GOOSE_BEARER_TOKEN A2A_GOOSE_HUB_TOKEN LITELLM_MASTER_KEY LITELLM_BASE_URL GOOSE_SERVER__SECRET_KEY; do
+    value="$(read_secret "${key}")"
+    if [ -n "${value}" ]; then
+      secrets="${secrets}${key}=${value}"$'\n'
+    fi
+  done
+  # goose's own provider settings, for the goose this script starts.
+  for key in GOOSE_PROVIDER GOOSE_MODEL GOOSE_PROVIDER__API_KEY LITELLM_HOST LITELLM_API_KEY; do
+    value="$(read_provider_secret "${key}")"
+    if [ -n "${value}" ]; then
+      secrets="${secrets}${key}=${value}"$'\n'
+    fi
+  done
+  # There is no keyring in a container, so goose must not go looking for the
+  # provider key in one: the env file is the store. An explicit value in the
+  # environment wins, so an operator can turn it back on.
+  local content="${secrets}GOOSE_DISABLE_KEYRING=${GOOSE_DISABLE_KEYRING:-1}"$'\n'
+  local written="${ENV_FILE}"
+  if [ -z "${secrets}" ]; then
+    if [ -f "${ENV_FILE}" ]; then
+      log "Doppler returned no secrets - keeping the existing ${ENV_FILE}"
+      chmod 600 "${ENV_FILE}" 2>/dev/null || true
+    else
+      umask 077
+      printf '%s' "${content}" >"${ENV_FILE}"
+      chmod 600 "${ENV_FILE}" 2>/dev/null || true
+    fi
+  else
+    umask 077
+    printf '%s' "${content}" >"${ENV_FILE}"
+    chmod 600 "${ENV_FILE}" 2>/dev/null || true
+    log "wrote ${ENV_FILE} (mode 0600)"
+  fi
+
+  # a2a-goose refuses to start without a bearer token, so a start that is certain
+  # to be refused is not attempted: the reason is the message, not a log line
+  # discovered afterwards.
+  if ! grep -q '^A2A_GOOSE_BEARER_TOKEN=' "${written}" 2>/dev/null; then
+    loud "The agent was NOT started: no A2A_GOOSE_BEARER_TOKEN is available." \
+      "It is looked for in this repo's Doppler config, then in ${COMMON_PROJECT}/${COMMON_CONFIG}." \
+      "The project is still usable without an agent - run 'doppler login', check that" \
+      "you can read ${COMMON_PROJECT}/${COMMON_CONFIG}, and retry when you can."
+    return 1
+  fi
+
+  # Not fatal - goose may still find a provider in its own config file - but it is
+  # the difference between an agent that answers and one that registers and then
+  # refuses every turn, which is worth saying out loud at start time.
+  if ! grep -q '^GOOSE_PROVIDER=' "${written}" 2>/dev/null; then
+    loud "The agent is starting with no goose provider configured." \
+      "No GOOSE_PROVIDER could be read from ${PROVIDER_PROJECT}/${PROVIDER_CONFIG}, and this devcontainer's own" \
+      "goose config is extensions-only." \
+      "It will register, and then fail every turn with 'Failed to resolve provider'." \
+      "Fix: run 'doppler login' (or point A2A_GOOSE_PROVIDER_PROJECT / _CONFIG at the right config) and restart."
+  fi
+
+  # The hub client refuses to dial at all when credentialEnv is empty, so a hub
+  # enabled with no token is a silent non-registration rather than a refused
+  # start - say it out loud here, because there is nothing downstream that will.
+  if [ "${HUB_ENABLED}" = "true" ] && [ -n "${HUB_URL}" ]; then
+    if ! grep -q '^A2A_GOOSE_HUB_TOKEN=' "${written}" 2>/dev/null; then
+      loud "The hub is enabled (${HUB_URL}) but no A2A_GOOSE_HUB_TOKEN is available." \
+        "It is looked for in this repo's Doppler config, then ${COMMON_PROJECT}/${COMMON_CONFIG}," \
+        "then ${PROVIDER_PROJECT}/${PROVIDER_CONFIG}." \
+        "The agent will start but refuse to dial the hub, so it will not appear in the fleet." \
+        "Fix: run 'doppler login' (or set A2A_GOOSE_HUB_TOKEN) and restart."
+    fi
+  fi
+  return 0
+}
+
+# The agent's config, schema = a2a-goose config/config.example.yaml, written to
+# $CONFIG_FILE and pointed at by $A2A_GOOSE_CONFIG.
+write_config_file() {
+  mkdir -p "${CONFIG_DIR}" || return 1
+  # The LiteLLM base URL is deployment-specific, so it is read from Doppler -
+  # this repo's config first, then the shared one - rather than fixed at
+  # generation time. Empty means the agent registers against nothing and every
+  # call to it fails; that is worth saying out loud, but it is not fatal.
+  local litellm_base_url
+  litellm_base_url="$(read_secret LITELLM_BASE_URL)"
+  if [ -z "${litellm_base_url}" ]; then
+    loud "No LITELLM_BASE_URL could be read from Doppler - the agent will" \
+      "register against an empty base URL and every call to it will fail." \
+      "Set LITELLM_BASE_URL in this repo's config, or in ${COMMON_PROJECT}/${COMMON_CONFIG}."
+  fi
+  umask 077
+  cat >"${CONFIG_FILE}" <<YAML
+server:
+  bind: "0.0.0.0:${CARD_PORT}"
+  publicUrl: "http://${CARD_ADDRESS}:${CARD_PORT}"
+  bearerTokenEnv: "A2A_GOOSE_BEARER_TOKEN"
+
+card:
+  name: "${AGENT_NAME}"
+  description: "goose in the devcontainer for ${PROJECT_NAME}"
+  protocolVersion: "1.0"
+
+goose:
+  acp:
+    url: "${ACP_URL}"
+    secretEnv: "GOOSE_SERVER__SECRET_KEY"
+    serve: "own"
+  defaults:
+    cwd: "${WORKSPACE}"
+    allowedRoots:
+      - "${WORKSPACE}"
+
+registry:
+  litellmBaseUrl: "${litellm_base_url}"
+  masterKeyEnv: "LITELLM_MASTER_KEY"
+  agentName: "${AGENT_NAME}"
+  # Re-registering by name is what reclaims the row a previous container left.
+  reRegisterOnCardChange: true
+YAML
+  # The hub block is appended, not part of the heredoc, because it is conditional.
+  # A `start` MUST NOT drop a tunnel that was there before: this is the only place
+  # the config is rewritten, so a hub block omitted here is one a running client
+  # loses on the next start. Fields match a2a-goose's config schema exactly -
+  # credentialEnv, connectTimeoutSecs, idleTimeoutSecs are case-sensitive.
+  if [ "${HUB_ENABLED}" = "true" ] && [ -n "${HUB_URL}" ]; then
+    cat >>"${CONFIG_FILE}" <<YAML
+
+hub:
+  enabled: true
+  url: "${HUB_URL}"
+  credentialEnv: "A2A_GOOSE_HUB_TOKEN"
+  kind: "a2a-goose"
+  connectTimeoutSecs: 10
+  idleTimeoutSecs: 90
+YAML
+  fi
+  chmod 600 "${CONFIG_FILE}" 2>/dev/null || true
+  log "wrote ${CONFIG_FILE}"
+}
+
+pid_of() {
+  [ -f "${PID_FILE}" ] || return 1
+  local pid
+  pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
+  [ -n "${pid}" ] || return 1
+  printf '%s' "${pid}"
+}
+
+# Alive *and* ours: a recycled PID must not be mistaken for the agent.
+is_running() {
+  local pid
+  pid="$(pid_of)" || return 1
+  kill -0 "${pid}" 2>/dev/null || return 1
+  if [ -r "/proc/${pid}/cmdline" ]; then
+    tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null | grep -q "a2a-goose" || return 1
+  fi
+  return 0
+}
+
+# The one case the launcher cannot fix for itself: a host that has never run it.
+cold_start() {
+  [ -x "${LAUNCHER}" ] && return 0
+  log "no launcher at ${LAUNCHER} - fetching one (cold start)"
+  mkdir -p "${DEPLOY_DIR}" 2>/dev/null || return 1
+  local tmp="${LAUNCHER}.tmp.$$"
+  if ! curl -fsSL --max-time "${TIMEOUT}" "${LAUNCHER_URL}" -o "${tmp}"; then
+    rm -f "${tmp}"
+    return 1
+  fi
+  chmod +x "${tmp}" 2>/dev/null || true
+  mv -f "${tmp}" "${LAUNCHER}" || {
+    rm -f "${tmp}"
+    return 1
+  }
+  log "installed the launcher at ${LAUNCHER}"
+  return 0
+}
+
+# Some hosts run the deployed agent as a *host process* rather than out of the
+# devcontainer this script manages - a launchd job, a DSM boot script, or
+# similar. Those deployments author ENV_FILE and CONFIG_FILE by hand, in shapes
+# this script does not emit (shell `export` lines; top-level
+# `executor:`/`tracing:`), and they carry settings no generator knows about -
+# the bind address, the public URL, LITELLM_CUSTOM_HEADERS, GOOSE_BIN, the hub
+# token. Regenerating over them would silently drop those, and a second agent
+# started here would race the one the unit already runs. So this script refuses
+# to manage a deployment it did not write.
+is_host_deployed() {
+  [ -f "${ENV_FILE}" ] && grep -q '^export ' "${ENV_FILE}" 2>/dev/null && return 0
+  [ -f "${CONFIG_FILE}" ] && grep -qE '^(executor|tracing):' "${CONFIG_FILE}" 2>/dev/null && return 0
+  return 1
+}
+
+cmd_start() {
+  mkdir -p "${CONFIG_DIR}" "${STATE_DIR}" 2>/dev/null || true
+
+  if is_host_deployed; then
+    loud "The agent was NOT started: ${CONFIG_DIR} is maintained by hand, not by this script." \
+      "This host runs a host-process deployment - a launchd job, a DSM boot" \
+      "script, or similar - not the devcontainer this script manages. That unit" \
+      "authors env + config.yaml and starts the agent; running this script would" \
+      "rewrite both, dropping settings it does not know about (executor, tracing," \
+      "the bind address, LITELLM_CUSTOM_HEADERS, ...), and race the agent that is" \
+      "already running. Start the unit instead, not this script."
+    return 0
+  fi
+
+  if ! resolve_card_address; then
+    loud "The agent was NOT started: no address to advertise could be resolved." \
+      "server.publicUrl must not be loopback, so the agent is not started on a" \
+      "guess. Join the container to the tailnet, or set the address explicitly" \
+      "(A2A_GOOSE_CARD_ADDRESS), and retry."
+    return 0
+  fi
+
+  write_env_file || return 0
+  write_config_file
+
+  if is_running; then
+    log "the agent ${AGENT_NAME} is already running (pid $(pid_of)) - nothing to do"
+    return 0
+  fi
+
+  if ! cold_start; then
+    loud "The agent ${AGENT_NAME} was NOT started: the launcher is absent and" \
+      "could not be fetched from ${LAUNCHER_URL} (no network?)." \
+      "A first start needs the network once. The project is still usable -" \
+      "retry when online."
+    return 0
+  fi
+
+  {
+    printf '%s agent-dev[%s]: starting %s for agent %s\n' \
+      "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$$" "${LAUNCHER}" "${AGENT_NAME}"
+  } >>"${LOG_FILE}" 2>/dev/null || true
+
+  # Backgrounded, output to the state log. NO_FETCH (and the rest of the
+  # environment) is inherited by the launcher. A PID file records the process
+  # the launcher `exec`s into, so it is the agent itself.
+  if command -v setsid >/dev/null 2>&1; then
+    A2A_GOOSE_CONFIG="${CONFIG_FILE}" DEPLOY_DIR="${DEPLOY_DIR}" \
+      ENV_FILE="${ENV_FILE}" MANIFEST_URL="${MANIFEST_URL}" TIMEOUT="${TIMEOUT}" \
+      setsid "${LAUNCHER}" >>"${LOG_FILE}" 2>&1 &
+  elif command -v nohup >/dev/null 2>&1; then
+    A2A_GOOSE_CONFIG="${CONFIG_FILE}" DEPLOY_DIR="${DEPLOY_DIR}" \
+      ENV_FILE="${ENV_FILE}" MANIFEST_URL="${MANIFEST_URL}" TIMEOUT="${TIMEOUT}" \
+      nohup "${LAUNCHER}" >>"${LOG_FILE}" 2>&1 &
+  else
+    A2A_GOOSE_CONFIG="${CONFIG_FILE}" DEPLOY_DIR="${DEPLOY_DIR}" \
+      ENV_FILE="${ENV_FILE}" MANIFEST_URL="${MANIFEST_URL}" TIMEOUT="${TIMEOUT}" \
+      "${LAUNCHER}" >>"${LOG_FILE}" 2>&1 &
+  fi
+  local pid=$!
+  printf '%s' "${pid}" >"${PID_FILE}" 2>/dev/null || true
+
+  # A launcher that dies at once has a reason in the log; surface it instead of
+  # reporting a start that is already over.
+  sleep 1
+  if ! kill -0 "${pid}" 2>/dev/null; then
+    rm -f "${PID_FILE}"
+    loud "The agent exited immediately. Last lines of ${LOG_FILE}:"
+    tail -n 20 "${LOG_FILE}" >&2 2>/dev/null || true
+    return 0
+  fi
+
+  log "the agent ${AGENT_NAME} is starting (pid ${pid})"
+  log "card: http://${CARD_ADDRESS}:${CARD_PORT}/"
+  return 0
+}
+
+cmd_stop() {
+  local pid
+  if ! pid="$(pid_of)"; then
+    log "no pid file at ${PID_FILE} - nothing to stop"
+    return 0
+  fi
+  if ! kill -0 "${pid}" 2>/dev/null; then
+    log "the agent (pid ${pid}) is not running - clearing the stale pid file"
+    rm -f "${PID_FILE}"
+    return 0
+  fi
+
+  log "sending SIGTERM to the agent (pid ${pid}); a clean shutdown deregisters it and stops its goose child"
+  kill -TERM "${pid}" 2>/dev/null || true
+
+  local waited=0
+  while kill -0 "${pid}" 2>/dev/null; do
+    if [ "${waited}" -ge 60 ]; then
+      loud "The agent (pid ${pid}) is still running ${waited}s after SIGTERM." \
+        "It has not confirmed a clean shutdown; not claiming it stopped."
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  rm -f "${PID_FILE}"
+  log "the agent stopped cleanly after ~${waited}s and is gone"
+  return 0
+}
+
+cmd_status() {
+  local pid
+  if pid="$(pid_of)" && kill -0 "${pid}" 2>/dev/null; then
+    printf 'agent %s: running (pid %s)\n' "${AGENT_NAME}" "${pid}"
+  else
+    printf 'agent %s: not running\n' "${AGENT_NAME}"
+  fi
+
+  if [ -z "${CARD_ADDRESS}" ]; then resolve_card_address >/dev/null 2>&1 || true; fi
+  if [ -n "${CARD_ADDRESS}" ]; then
+    printf 'card: http://%s:%s/\n' "${CARD_ADDRESS}" "${CARD_PORT}"
+  else
+    printf 'card: unknown (no address resolved)\n'
+  fi
+
+  # A registered agent with no provider refuses every turn, so report it beside
+  # the card rather than leaving it for whoever makes the first call.
+  if [ -f "${ENV_FILE}" ]; then
+    local provider
+    provider="$(sed -n 's/^GOOSE_PROVIDER=//p' "${ENV_FILE}" | head -1)"
+    if [ -n "${provider}" ]; then
+      printf 'goose provider: %s\n' "${provider}"
+    else
+      printf 'goose provider: none in %s (turns will fail to resolve one)\n' "${ENV_FILE}"
+    fi
+  fi
+
+  if [ -f "${LOG_FILE}" ]; then
+    printf '\nlast 20 lines of %s:\n' "${LOG_FILE}"
+    tail -n 20 "${LOG_FILE}" || true
+  else
+    printf '\nno log yet at %s\n' "${LOG_FILE}"
+  fi
+}
+
+case "${1:-}" in
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  status) cmd_status ;;
+  -h | --help | help | "") usage ;;
+  *)
+    printf 'agent-dev.sh: unknown subcommand: %s\n\n' "$1" >&2
+    usage
+    exit 2
+    ;;
+esac

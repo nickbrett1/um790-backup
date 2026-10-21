@@ -59,11 +59,50 @@ steps:
         fi
         echo "batch image ran to completion and exited 0"
 
+  # The only step that tests the DECISIONS prune makes rather than the mechanics
+  # of reaching them. `--dry-run` proves the script parses argv; it cannot prove
+  # which snapshots a retention policy selects, because CI has no NAS and no
+  # repository history to select from - and that selection is the one part of
+  # this job that can destroy data.
+  #
+  # It runs inside the built image (so it tests the restic binary and the jq that
+  # actually ship), against synthetic snapshot names and throwaway LOCAL
+  # repositories, with the network switched off: a green result cannot depend on
+  # anything outside the image and the repository.
+  - label: ":test_tube: Retention decisions (offline, in the image)"
+    key: retention_tests
+    depends_on:
+      - build
+    agents:
+      queue: mac-studio-linux
+    env:
+      TEST_IMAGE: um790-backup-retention
+    commands:
+      - |
+        set -euo pipefail
+        # Its own build rather than reusing docker_batch_smoke: that step removes
+        # its image on the way out, and reordering it to leave the image behind
+        # would make this step's pass depend on another step's cleanup policy.
+        docker build -t "$$TEST_IMAGE:$$BUILDKITE_COMMIT" .
+      - |
+        set -euo pipefail
+        CONTAINER="$$TEST_IMAGE-$$BUILDKITE_JOB_ID"
+        trap 'exit 143' TERM INT
+        trap 'docker rm -f "$$CONTAINER" >/dev/null 2>&1 || true; docker rmi "$$TEST_IMAGE:$$BUILDKITE_COMMIT" >/dev/null 2>&1 || true' EXIT
+        # --entrypoint overrides the image's phase runner; --network=none is the
+        # point of the step, so a test that starts reaching for the network fails
+        # here rather than quietly depending on it. No mounts, no env, no secrets.
+        docker run --rm --name "$$CONTAINER" --network=none \
+          --entrypoint /bin/bash \
+          "$$TEST_IMAGE:$$BUILDKITE_COMMIT" \
+          /app/scripts/test-retention.sh
+
   - label: ":docker: Build and publish image (GHCR)"
     key: docker_publish
     depends_on:
       - build
       - docker_batch_smoke
+      - retention_tests
     if: build.branch == "main"
     agents:
       queue: mac-studio-linux
@@ -134,3 +173,39 @@ steps:
           --cache-to type=registry,ref=$$CACHE_REF,mode=max \
           --label org.opencontainers.image.revision=$$BUILDKITE_COMMIT \
           -t $$IMAGE:$$BUILDKITE_COMMIT -t $$IMAGE:latest --push .
+
+  # Promotion, not deployment. A green build lands as a one-line diff in the DAG
+  # repository, on a branch, for a human to merge - the pin is never edited by
+  # hand again, and nothing reaches the NAS without a review step.
+  #
+  # Why not have the DAG track a tag and pull it: the phases are separate
+  # `docker run --rm` invocations, so an image that changes between them makes a
+  # failure unreproducible and a retry not identical; and `prune` can destroy
+  # snapshot history, where a bad pin costs a one-line revert and a bad channel
+  # costs a re-publish. Rollback direction is the whole argument.
+  #
+  # Runs in a throwaway container because the host is a Mac whose jq/git versions
+  # are not the fleet's business; the image needs git, curl and jq, nothing else.
+  - label: ":arrow_up: Open DAG pin bump (PR)"
+    key: dagu_pin_bump
+    depends_on:
+      - docker_publish
+    # `.disabled` is never enabled by this step: merging the PR sets the pin, and
+    # enabling the schedule stays a separate rename by a human.
+    if: build.branch == "main"
+    agents:
+      queue: mac-studio-linux
+    plugins:
+      - docker#v5.13.0:
+          image: "debian:bookworm-slim"
+          platform: linux/arm64
+          workdir: /workdir
+          # Only these reach the container. A step-level env: value does not get
+          # through the docker plugin unless it is named here.
+          environment:
+            - DOPPLER_TOKEN
+            - BUILDKITE_COMMIT
+            - BUILDKITE_BUILD_URL
+    commands:
+      - apt-get update && apt-get install -y --no-install-recommends git curl jq ca-certificates
+      - bash scripts/bump-dagu-pin.sh

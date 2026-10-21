@@ -1,10 +1,24 @@
-/srv/backups
+# Exclude list for `restic backup /srv`. One pattern per line; blank lines and
+# #-comments are ignored by restic. Installed to /srv/.um790-backup/exclude.txt
+# by the preflight phase, so edit this file - not the copy on the host, which is
+# overwritten from the image on every run.
+#
+# Staging is not listed separately: it lives at /srv/.um790-backup/staging and
+# the directory below covers it. Excluding it matters or each run would back up
+# the previous run's staging.
 /srv/.um790-backup
-/srv/backup-staging
+
+# Backup targets and other machines' data: large, and not ours to restore.
+/srv/backups
 /srv/marketdata
+
+# Postgres data directories. The database contents are covered by pg_dump in the
+# dumps phase; copying the raw cluster would be inconsistent and far larger.
 /srv/docker/litellm/postgres_data
 /srv/docker/miniflux/db
 /srv/docker/miniflux-explore/db
+
+# Caches and logs: rebuildable, and noisy in the snapshot diff.
 /srv/docker/open-webui/terminal-data
 /srv/docker/open-webui/data/cache
 /srv/docker/openclaw/config/tmp
@@ -12,6 +26,9 @@
 /srv/docker/netdata/cache
 /srv/msgvault/backup-cache
 /srv/docker/pihole/config/listsCache
+
+# Dagu's own state. Its run history is not worth restoring and the logs churn on
+# every run.
 /srv/reader/docker/dagu/data/logs
 /srv/reader/docker/dagu/data/dagu-data
 /srv/reader/docker/dagu/data/dag-runs
@@ -21,6 +38,8 @@
 /srv/reader/docker/dagu/data/state
 /srv/reader/docker/dagu/data/auth
 /srv/reader/docker/dagu/data/scheduler
+
+# Synology and macOS filesystem litter.
 **/.DS_Store
 **/@eaDir
 **/@SynoEAStream

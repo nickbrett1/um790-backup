@@ -50,6 +50,14 @@ BASE="${BASE:-/srv/.um790-backup}"
 STAGE="${STAGE:-$BASE/staging}"
 STATE="$BASE/state"
 CACHE="$BASE/cache"
+
+# The exclude list is authored in the repo and INSTALLED into $BASE by preflight.
+# Two paths on purpose: /app is the image (read-only, and replaced wholesale on the
+# next `docker pull`), while $BASE is the persistent mount that `backup` - a
+# different container - can actually read. The repo copy is the source of truth: it
+# is overwritten every run, so a hand-edited $EXCLUDES is not preserved. Edit
+# deploy/exclude.txt and let the image carry it.
+EXCLUDES_SRC="${EXCLUDES_SRC:-/app/deploy/exclude.txt}"
 EXCLUDES="${EXCLUDES:-$BASE/exclude.txt}"
 
 # Snapshot retention is COUNT-based against a WEEKLY prune: 8 snapshots ~= 8 weeks
@@ -205,6 +213,7 @@ do_preflight() {
   require_cmds restic ssh jq docker sqlite3 curl numfmt du stat
 
   if [[ $DRY_RUN == 1 ]]; then
+    log "dry-run: would install ${EXCLUDES_SRC} -> ${EXCLUDES}"
     log "dry-run: would assert RESTORE.md, NAS reachability, passwordless sudo,"
     log "dry-run: repo openable, source <= ${MAX_SOURCE_GB}G, then take the run lock"
     log "dry-run: repository=${RESTIC_REPOSITORY}"
@@ -225,6 +234,21 @@ do_preflight() {
   [[ -d $BASE ]] || die "writable state mount ${BASE} missing (compose volume not mounted?)"
   install -d -m 0700 "$STATE" "$CACHE" || die "cannot create state/cache under ${BASE}"
   [[ -w $BASE ]] || die "${BASE} is not writable by uid $(id -u)"
+
+  # Install the exclude list BEFORE any network work. It is a local precondition:
+  # if the image was built without deploy/exclude.txt there is no backup worth
+  # making, and finding that out after the NAS round-trip and under a taken lock
+  # would mean a failed run has to be cleaned up rather than simply not started.
+  #
+  # `backup` hard-fails when $EXCLUDES is absent, and this is what guarantees it is
+  # present in THAT container: $BASE is the one path both containers share.
+  [[ -f $EXCLUDES_SRC ]] \
+    || die "exclude list ${EXCLUDES_SRC} missing from the image — deploy/exclude.txt was not COPYed in"
+  [[ -s $EXCLUDES_SRC ]] \
+    || die "exclude list ${EXCLUDES_SRC} is empty — refusing to run with no excludes"
+  install -m 0644 "$EXCLUDES_SRC" "$EXCLUDES" \
+    || die "cannot install ${EXCLUDES_SRC} -> ${EXCLUDES}"
+  log "installed exclude list ($(grep -c . "$EXCLUDES" || true) patterns) -> ${EXCLUDES}"
 
   # A lock from a crashed run must not block forever, but a lock that is hours old
   # is more likely a genuinely stuck run than a corpse.
@@ -254,8 +278,6 @@ do_preflight() {
   # carry-over. State lives beside it and is never wiped.
   rm -rf "$STAGE"
   install -d -m 0700 "$STAGE" "$STAGE/config" "$STAGE/sqlite" "$STAGE/pg" "$STAGE/.tmp"
-
-  [[ -f $EXCLUDES ]] || log "WARNING: $EXCLUDES missing — the backup will run WITHOUT excludes"
 
   printf '%s\n' "${DAG_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}" > "$STATE/run.lock"
   stamp > "$STATE/backup_start.epoch"
@@ -411,9 +433,12 @@ do_backup() {
   local run_id
   run_id=$(cat "$STATE/run.lock")
 
-  # An exclude file that has gone missing turns this into a much larger backup
-  # (pg data dirs, caches) without failing. Check, don't assume.
-  [[ -f $EXCLUDES ]] || die "exclude file ${EXCLUDES} missing — refusing to back up without excludes"
+  # preflight installs the exclude list into $BASE, and $BASE is the mount this
+  # container shares with it - so this failing means preflight did not complete,
+  # not that the list needs fetching. Without excludes the backup silently swallows
+  # Postgres data directories and caches, so this stays a hard stop.
+  [[ -f $EXCLUDES ]] \
+    || die "exclude file ${EXCLUDES} missing — preflight installs it from ${EXCLUDES_SRC}; did preflight complete?"
 
   restic_run backup /srv "$STAGE" \
     --exclude-file="$EXCLUDES" \
@@ -619,6 +644,7 @@ main() {
     log "validate-only: argv contract ok; phases = preflight config dumps backup check snapshot prune status fail"
     log "validate-only: repository=${RESTIC_REPOSITORY}"
     log "validate-only: staging=${STAGE} state=${STATE}"
+    log "validate-only: excludes=${EXCLUDES} (from ${EXCLUDES_SRC})"
     return 0
   fi
 

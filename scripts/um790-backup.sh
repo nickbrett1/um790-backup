@@ -12,6 +12,10 @@
 # bare $1 and a human puts it last. It never requires secrets, never opens the repo,
 # never touches /srv and never contacts the NAS: the CI smoke gate runs the image
 # with no environment at all and this must still exit 0.
+#
+# This file is also SOURCED by scripts/test-retention.sh, which drives
+# snapshot_epoch and select_sweep_candidates directly. That is why the entry point
+# at the bottom is guarded: importing the functions must not run main.
 set -Eeuo pipefail
 IFS=$'\n\t'
 
@@ -76,8 +80,8 @@ EXCLUDES="${EXCLUDES:-$BASE/exclude.txt}"
 # safety margin (the thing you find out about when you need it).
 #
 # Scope: this governs the NAS-side Btrfs snapshots that `prune` sweeps. It is a
-# separate axis from restic's own --keep-daily/--keep-weekly policy inside the
-# repository, which is fixed in do_prune below.
+# separate axis from restic's own keep policy inside the repository, which is
+# RESTIC_KEEP_ARGS below.
 #
 # Deprecated alias: KEEP_SNAPSHOTS. It now means weeks, not a count, because
 # treating a stale count as a duration is exactly the bug above. Warn rather than
@@ -100,6 +104,12 @@ fi
 
 # 6h: prune must run within the same run as the snapshot it protects.
 SNAPSHOT_MAX_AGE="${SNAPSHOT_MAX_AGE:-$((6 * 3600))}"
+
+# restic's own retention policy, inside the repository. Named rather than written
+# inline at the two call sites in do_prune so the offline test can apply the SAME
+# arguments to a throwaway repository and assert what survives - a test that
+# restated the policy would drift from it silently.
+RESTIC_KEEP_ARGS=(--keep-daily 7 --keep-weekly 4 --keep-monthly 6)
 
 MAX_SOURCE_GB="${MAX_SOURCE_GB:-45}"
 EXPECTED_MIN_CONTAINERS="${EXPECTED_MIN_CONTAINERS:-60}"
@@ -239,6 +249,54 @@ snapshot_epoch() { # name -> epoch, empty on parse failure
   local name=$1 ts
   ts=$(sed -E 's/^GMT[+-][0-9]{2}-//' <<<"$name")
   date -u -d "${ts//./-}" +%s 2>/dev/null || true
+}
+
+# Which snapshots the sweep may delete: a pure function of (now, window, names),
+# which is what makes it testable without a NAS. scripts/test-retention.sh calls
+# THIS function rather than a copy, so the test cannot drift from the runner.
+#
+# stdin:  snapshot names, one per line
+# stdout: the names to delete, one per line
+# stderr: warnings, so a caller can capture the list on its own
+#
+# Two properties that are load-bearing:
+#   - a name that cannot be parsed is LEFT ALONE and logged. An empty result is
+#     the safe answer; a guessed one deletes snapshots.
+#   - the newest snapshot is never a candidate, even when every snapshot has
+#     expired. This used to be done by truncating the deletion list to total-1
+#     entries, which relied on DSM's list order - undocumented - so it could keep
+#     an arbitrary OLD snapshot and delete the most recent point in time.
+select_sweep_candidates() { # now_epoch retention_days
+  local now=$1 days=$2 name ep
+  local -a names=() epochs=()
+  local newest=-1
+
+  while read -r name; do
+    [[ -n $name ]] || continue
+    ep=$(snapshot_epoch "$name")
+    if [[ -z $ep ]]; then
+      printf 'WARNING: cannot parse snapshot name %q — leaving it alone\n' "$name" >&2
+      continue
+    fi
+    names+=("$name")
+    epochs+=("$ep")
+    # Written as `if`, not `(( )) && ...`: a false AND-list as the last command in
+    # a loop body returns non-zero, which exits the shell under set -e with no
+    # message - the same trap documented in do_dumps.
+    if (( ep > newest )); then
+      newest=$ep
+    fi
+  done
+
+  local i
+  for i in "${!names[@]}"; do
+    if (( epochs[i] == newest )); then
+      continue
+    fi
+    if (( now - epochs[i] > days * 86400 )); then
+      printf '%s\n' "${names[$i]}"
+    fi
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -546,8 +604,8 @@ do_snapshot() {
 do_prune() {
   if [[ $DRY_RUN == 1 ]]; then
     log "dry-run: would require snapshot.epoch >= backup_start.epoch and < ${SNAPSHOT_MAX_AGE}s old"
-    log "dry-run: would 'restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6' (dry-run first)"
-    log "dry-run: would delete ${SHARE} snapshots older than ${SNAPSHOT_RETENTION_DAYS}d, keeping at least 1"
+    log "dry-run: would 'restic forget ${RESTIC_KEEP_ARGS[*]}' (dry-run first)"
+    log "dry-run: would delete ${SHARE} snapshots older than ${SNAPSHOT_RETENTION_DAYS}d, never the newest"
     return 0
   fi
   require_cmds restic ssh jq
@@ -578,36 +636,27 @@ do_prune() {
     || die "newest restic snapshot (${latest}) predates this run — refusing to prune"
 
   # Show what dies, then kill it.
-  restic_run forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --dry-run \
+  restic_run forget "${RESTIC_KEEP_ARGS[@]}" --dry-run \
     || die "forget --dry-run failed — not proceeding to a real forget"
-  restic_run forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune \
+  restic_run forget "${RESTIC_KEEP_ARGS[@]}" --prune \
     || die "restic forget --prune failed"
 
   # Snapshot sweep, age-based rather than positional: DSM's list order is not
-  # documented, and an off-by-one here deletes the wrong point in time.
+  # documented, and a positional rule here deletes the wrong point in time. The
+  # selection itself lives in select_sweep_candidates so scripts/test-retention.sh
+  # can drive it offline.
   local names total
   names=$(snapshot_names | grep . || true)
   total=$(printf '%s\n' "$names" | grep -c . || true)
   total=${total:-0}
   log "snapshots before sweep: ${total} (retention ${SNAPSHOT_RETENTION_DAYS}d = ${SNAPSHOT_RETENTION_WEEKS} weeks)"
 
-  local doomed=() name ep
-  while read -r name; do
-    [[ -n $name ]] || continue
-    ep=$(snapshot_epoch "$name")
-    if [[ -z $ep ]]; then
-      log "WARNING: cannot parse snapshot name '${name}' — leaving it alone"
-      continue
-    fi
-    if (( $(stamp) - ep > SNAPSHOT_RETENTION_DAYS * 86400 )); then
-      doomed+=("$name")
-    fi
-  done <<< "$names"
-
-  # Never delete the last snapshot, however old: it is the only undo left.
-  if (( ${#doomed[@]} >= total && total > 0 )); then
-    log "WARNING: sweep would delete every snapshot; keeping the newest and skipping the rest"
-    doomed=("${doomed[@]:0:$((total - 1))}")
+  local doomed=()
+  if (( total > 0 )); then
+    # The selector logs unparseable names and never returns the newest snapshot,
+    # so there is always a point in time left to restore to.
+    mapfile -t doomed < <(printf '%s\n' "$names" \
+      | select_sweep_candidates "$(stamp)" "$SNAPSHOT_RETENTION_DAYS")
   fi
 
   if (( ${#doomed[@]} == 0 )); then
@@ -685,6 +734,7 @@ main() {
     log "validate-only: staging=${STAGE} state=${STATE}"
     log "validate-only: excludes=${EXCLUDES} (from ${EXCLUDES_SRC})"
     log "validate-only: retention=${SNAPSHOT_RETENTION_DAYS}d (${SNAPSHOT_RETENTION_WEEKS} weeks)"
+    log "validate-only: keep policy=${RESTIC_KEEP_ARGS[*]}"
     return 0
   fi
 
@@ -706,4 +756,8 @@ main() {
   esac
 }
 
-main "$@"
+# Guarded so scripts/test-retention.sh can source this file for the real
+# snapshot_epoch/select_sweep_candidates: importing must not run a phase.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

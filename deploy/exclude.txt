@@ -1,4 +1,3 @@
---cache-dir=/var/tmp/um790-backup-cache
 /srv/backups
 /srv/.um790-backup
 /srv/backup-staging

@@ -37,11 +37,17 @@ RESTIC_SSH_KEY="${RESTIC_SSH_KEY:-/run/ssh/id_ed25519_restic}"
 KNOWN_HOSTS="${KNOWN_HOSTS:-/run/ssh/known_hosts}"
 NTFY_URL="${NTFY_URL:-}"
 
-# Staging is INSIDE the container, on the writable layer. /srv is mounted read-only
-# and `rm -rf` there would fail; more importantly a staging tree under /srv gets
-# picked up by the very backup that is meant to be finishing.
-STAGE="${STAGE:-/var/tmp/um790-backup-staging}"
-BASE="${BASE:-/srv/.um790-backup}"               # writable, and excluded from the backup
+# Writable, persistent, and excluded from the backup. Everything that must outlive
+# this container goes here.
+#
+# Staging MUST be on a mounted path, not in the container's writable layer: the DAG
+# runs each phase as its own `docker run --rm`, so anything written to the image
+# filesystem is gone before the next phase starts - `config` and `dumps` would stage
+# into a directory `backup` never sees. It also must not sit under a read-only /srv
+# path (the original design used /srv/backup-staging, where `rm -rf` fails), and it
+# must be excluded from the backup or each run backs up the previous run's staging.
+BASE="${BASE:-/srv/.um790-backup}"
+STAGE="${STAGE:-$BASE/staging}"
 STATE="$BASE/state"
 CACHE="$BASE/cache"
 EXCLUDES="${EXCLUDES:-$BASE/exclude.txt}"
@@ -147,7 +153,10 @@ require_phase() {
 # one place. `sftp.args` is what the sftp backend passes to ssh; without it restic
 # would use the default port and no key, and fail on a container that has no
 # ~/.ssh/config.
-RESTIC_OPTS=(-o "sftp.args=-p ${NAS_PORT} -i ${RESTIC_SSH_KEY} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${KNOWN_HOSTS} -o LogLevel=ERROR")
+RESTIC_OPTS=(
+  --cache-dir "$CACHE"
+  -o "sftp.args=-p ${NAS_PORT} -i ${RESTIC_SSH_KEY} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${KNOWN_HOSTS} -o LogLevel=ERROR"
+)
 restic_run() { command restic "${RESTIC_OPTS[@]}" "$@"; }
 
 nas_ssh() {
@@ -199,6 +208,7 @@ do_preflight() {
     log "dry-run: would assert RESTORE.md, NAS reachability, passwordless sudo,"
     log "dry-run: repo openable, source <= ${MAX_SOURCE_GB}G, then take the run lock"
     log "dry-run: repository=${RESTIC_REPOSITORY}"
+    log "dry-run: staging=${STAGE} state=${STATE}"
     return 0
   fi
 
@@ -209,6 +219,12 @@ do_preflight() {
   [[ -f /srv/RESTORE.md ]] \
     || die "RESTORE.md missing at /srv/RESTORE.md — restore path undocumented, refusing to back up"
   [[ -d /srv ]] || die "/srv is not mounted (read-only bind missing?)"
+
+  # Everything writable hangs off BASE, so prove it is a mount and not the image
+  # filesystem before writing a single file into it.
+  [[ -d $BASE ]] || die "writable state mount ${BASE} missing (compose volume not mounted?)"
+  install -d -m 0700 "$STATE" "$CACHE" || die "cannot create state/cache under ${BASE}"
+  [[ -w $BASE ]] || die "${BASE} is not writable by uid $(id -u)"
 
   # A lock from a crashed run must not block forever, but a lock that is hours old
   # is more likely a genuinely stuck run than a corpse.
@@ -230,12 +246,12 @@ do_preflight() {
 
   local src_gb
   src_gb=$(du -sx --block-size=1G /srv 2>/dev/null | cut -f1)
-  src_gb=${src_gb:-0}
+  [[ $src_gb =~ ^[0-9]+$ ]] || die "cannot measure /srv size (du returned '${src_gb:-}')"
   (( src_gb <= MAX_SOURCE_GB )) \
     || die "source is ${src_gb}G, above MAX_SOURCE_GB=${MAX_SOURCE_GB} — wrong mount, or raise the limit deliberately"
 
-  # Staging lives in the container; only the state dir needs to exist and be writable.
-  install -d -m 0700 "$STATE" "$CACHE"
+  # Staging is wiped every run: it must be a clean restore input, never a
+  # carry-over. State lives beside it and is never wiped.
   rm -rf "$STAGE"
   install -d -m 0700 "$STAGE" "$STAGE/config" "$STAGE/sqlite" "$STAGE/pg" "$STAGE/.tmp"
 
@@ -253,7 +269,7 @@ do_config() {
   local out=$STAGE/config
 
   if [[ $DRY_RUN == 1 ]]; then
-    log "dry-run: would 'docker ps -a' and 'docker inspect' every container into $out"
+    log "dry-run: would 'docker ps -a' and 'docker inspect' every container into ${out}"
     log "dry-run: would scrub PASSWORD/SECRET/TOKEN/API_KEY values, keeping the keys"
     return 0
   fi
@@ -263,6 +279,8 @@ do_config() {
   # silently contains no container configuration.
   docker ps >/dev/null 2>&1 \
     || die "docker daemon unreachable — mount /var/run/docker.sock into the container"
+
+  [[ -d $out ]] || die "${out} missing — the preflight phase did not run in this cycle"
 
   docker ps -a --format '{{.Names}}' | sort > "$out/containers.txt"
   local n
@@ -301,6 +319,7 @@ do_dumps() {
   fi
 
   require_cmds docker sqlite3
+  [[ -d $STAGE/pg ]] || die "${STAGE} missing — the preflight phase did not run in this cycle"
 
   local c out sz user db
   for c in "${PG_CONTAINERS[@]}"; do
@@ -308,25 +327,25 @@ do_dumps() {
     # exactly. The password never leaves the container: pg_dump reads PGPASSWORD
     # from the container's own environment.
     user=$(docker exec "$c" sh -c 'printf %s "${POSTGRES_USER:-postgres}"' 2>/dev/null) \
-      || die "pg container $c not running (or has no shell)"
+      || die "pg container ${c} not running (or has no shell)"
     db=$(docker exec "$c" sh -c 'printf %s "${POSTGRES_DB:-postgres}"' 2>/dev/null) || db=""
-    [[ -n $user && -n $db ]] || die "$c: cannot read POSTGRES_USER/POSTGRES_DB"
-    log "pg $c: dumping ${user}@${db}"
+    [[ -n $user && -n $db ]] || die "${c}: cannot read POSTGRES_USER/POSTGRES_DB"
+    log "pg ${c}: dumping ${user}@${db}"
 
     out=$STAGE/pg/${c}.dump
     docker exec "$c" sh -c 'exec pg_dump -U "$1" -d "$2" -Fc' _ "$user" "$db" > "$out" \
-      || die "pg_dump failed for $c"
+      || die "pg_dump failed for ${c}"
 
     # An exit-0 empty dump is the classic "successful" backup that restores nothing.
-    [[ $(head -c 5 "$out") == "PGDMP" ]] || die "$c: dump is not custom-format (empty or truncated)"
+    [[ $(head -c 5 "$out") == "PGDMP" ]] || die "${c}: dump is not custom-format (empty or truncated)"
     sz=$(stat -c %s "$out")
-    (( sz > 4096 )) || die "$c: dump implausibly small (${sz}B)"
-    log "pg $c -> ${sz}B"
+    (( sz > 4096 )) || die "${c}: dump implausibly small (${sz}B)"
+    log "pg ${c} -> ${sz}B"
   done
 
-  local entry name tmp
+  local entry name tmp dbpath
   for entry in "${SQLITE_DBS[@]}"; do
-    local dbpath=${entry%%|*}
+    dbpath=${entry%%|*}
     name=${entry##*|}
     [[ -f $dbpath ]] || die "sqlite ${name} missing at ${dbpath} (moved, renamed, or wrong mount)"
 
@@ -363,7 +382,7 @@ do_dumps() {
 # ---------------------------------------------------------------------------
 do_backup() {
   if [[ $DRY_RUN == 1 ]]; then
-    log "dry-run: would 'restic backup /srv $STAGE' with --exclude-file=$EXCLUDES"
+    log "dry-run: would 'restic backup /srv ${STAGE}' with --exclude-file=${EXCLUDES}"
     log "dry-run: tags um790,run:<id>, --host um790, --retry-lock 5m"
     return 0
   fi
@@ -372,7 +391,7 @@ do_backup() {
 
   # Refuse to record a snapshot that is missing the phase outputs. restic would
   # happily back up /srv alone and report success.
-  [[ -f $STATE/run.lock ]] || die "no run.lock — preflight did not run in this invocation"
+  [[ -f $STATE/run.lock ]] || die "no run.lock — preflight did not run in this cycle"
   [[ -f $STAGE/config/containers.txt ]] || die "no container config staged — the config phase did not run"
   local pg sqlite
   pg=$(find "$STAGE/pg" -name '*.dump' -type f 2>/dev/null | grep -c . || true)
@@ -525,7 +544,7 @@ do_prune() {
     log "no snapshots older than ${SNAPSHOT_RETENTION_DAYS}d; sweep is a no-op"
   else
     log "deleting ${#doomed[@]} snapshot(s) older than ${SNAPSHOT_RETENTION_DAYS}d: ${doomed[*]}"
-    # delete takes several names in one call
+    # delete takes several snapshot names in one call
     local quoted=() s
     for s in "${doomed[@]}"; do quoted+=("'${s}'"); done
     nas_ssh "sudo -n /usr/syno/sbin/synosharesnapshot delete '${SHARE}' ${quoted[*]}" \

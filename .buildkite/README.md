@@ -80,6 +80,13 @@ Provided by the agent's `environment` hook, by name:
   `environment` hook, where every job on the fleet could read it. Without it,
   provide `GHCR_USERNAME` and `GHCR_TOKEN` in the agent's `environment` hook.
   Runs on the agent, which has the Docker daemon it needs.
+- **DAG pin bump** (this project's own step) — `DOPPLER_TOKEN` only; the step
+  resolves `DAGU_DAGS_TOKEN` from Doppler (`common`/`prd`) at run time. It is a
+  fine-grained PAT for `nickbrett1/dagu-dags` with `Contents: read & write` and
+  `Pull requests: read & write`, so it can push one branch and open one PR and
+  cannot touch any other repository. `BUILDKITE_COMMIT` and
+  `BUILDKITE_BUILD_URL` reach the container too, but are Buildkite's own
+  variables rather than secrets.
 
 This list is a bullet list rather than a table on purpose: a generated file has
 to survive `prettier --check` in this project's own lint step, and prettier
@@ -98,3 +105,19 @@ re-pads markdown tables to its own column widths.
   a `Cargo.lock` that matches `Cargo.toml`. A missing or stale lockfile fails
   those commands rather than silently resolving new versions — which is the
   point of the flag, and the reason to commit the lockfile with the manifest.
+- **Cleanup traps must survive cancellation**, and they cost one character to get
+  wrong. A shell killed by `SIGTERM` does not run its `EXIT` trap, so every step
+  that creates a builder, container or image installs `trap 'exit 143' TERM INT`
+  first; otherwise the cleanup is skipped exactly when it is needed.
+- **Buildkite interpolates whole command blocks, comments included, and `$$` is
+  its escape for one literal `$`.** A variable assigned *inside* the script must
+  therefore be written with two dollars before it: two dollars reach the shell as
+  one, and the shell expands the value the script set. Three dollars is a real
+  bug that this pipeline shipped once — it silently deleted a volume that never
+  existed, which looks like cleanup and is a no-op. Describe such sequences in
+  words in a comment, because an example written with the dollar signs is
+  rewritten before anyone reads it in the job log.
+- The `retention_tests` step here is the pattern worth copying for any job whose
+  "test" is a `--dry-run`: a dry run proves the code path is reached, not that
+  the decision at the end of it is right. Where a decision is computable from
+  plain inputs, extract it into a function and drive it in the image.

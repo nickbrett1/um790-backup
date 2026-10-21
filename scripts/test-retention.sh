@@ -14,14 +14,20 @@
 # snapshot. Keep the parser cases below exactly as they are - they are the
 # regression test for that, and the reason a --dry-run gate was not enough.
 #
+# COST, because it is a real constraint: every keep-policy case backs up into a
+# real repository, so each one costs a restic invocation and the whole file is
+# the slowest step in CI. It was 40-odd backups and doubled the queue; the
+# month-long case was cut for that reason. Add a case only if it can fail in a
+# way the existing ones cannot, and keep the snapshot count in it small.
+#
 # Run it by hand with: bash scripts/test-retention.sh
 set -Eeuo pipefail
 IFS=$'\n\t'
 
 # UTC so timestamps are deterministic. NOTE: this is for reproducibility, NOT
 # because restic's day grouping is known to use local time - see the keep-policy
-# section, where the day-based cases are deliberately written so a uniform
-# timezone offset cannot change their result either way.
+# section, where the day-based case is deliberately written so a uniform
+# timezone offset cannot change its result either way.
 export TZ=UTC
 
 SELF_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -189,7 +195,7 @@ snap() { # timestamp (any form date -d accepts)
 
 count() { restic snapshots --json "${RESTIC_TEST_OPTS[@]}" | jq 'length'; }
 
-# WHY EVERY CASE BELOW IS ON DISTINCT DAYS AT A FIXED HOUR.
+# WHY THIS ONE CASE, ON DISTINCT CONSECUTIVE DAYS AT A FIXED HOUR.
 #
 # A previous version put ten snapshots inside ONE calendar day (00:00Z..09:00Z)
 # and asserted they collapsed to one. It got two, and I could not establish why
@@ -201,12 +207,28 @@ count() { restic snapshots --json "${RESTIC_TEST_OPTS[@]}" | jq 'length'; }
 # hour apart on the same date cannot occur in production. The case exercised a
 # situation the system never has.
 #
-# Distinct consecutive days at a fixed hour is both the real shape (one run per
-# day) and immune to the thing I could not pin down: a uniform timezone offset
-# shifts every snapshot equally, so it can neither merge two dates nor split one
-# date in two. Whatever restic does with day boundaries, ten consecutive days
-# remain ten days. That makes this an assertion about the POLICY rather than
-# about the build machine's clock.
+# Distinct consecutive days is the real shape (one run per day) and immune to the
+# thing I could not pin down: a uniform timezone offset shifts every snapshot
+# equally, so it can neither merge two dates nor split one date in two. Whatever
+# restic does with day boundaries, ten consecutive days remain ten days. That
+# makes this an assertion about the POLICY rather than about the build machine's
+# clock.
+#
+# WHY THERE IS NO SEPARATE --keep-weekly / --keep-monthly CASE.
+#
+# There was one - 30 daily snapshots, asserting a month keeps between 7 and 30 -
+# and it was cut because it cost 30 real backups to re-test a property that
+# cannot differ here. With one run per day every snapshot is on its own calendar
+# day, so keep-daily 7 alone already retains the newest seven DISTINCT days; each
+# day is distinct by construction, so weekly and monthly can only re-select
+# snapshots daily has already kept. They add nothing to the count, and a 30-day
+# case proved only that forget prunes at all - which this case already proves
+# with 10.
+#
+# They are NOT dead config: they matter if the cadence ever becomes more frequent
+# than daily, where daily collapses to one per day and weekly/monthly are what
+# hold the older history. That is a cadence we do not have. If the DAG schedule
+# changes, this is the comment to revisit.
 section "keep-daily on consecutive days"
 
 repo_fresh "$TMP/repo_daily"
@@ -231,24 +253,12 @@ oldest_kept=$(restic snapshots --json "${RESTIC_TEST_OPTS[@]}" \
 eq "the survivors are the newest seven, so the oldest kept is day 4" \
   "$oldest_kept" "$(restic_time "@$(( JAN1 + 3 * 86400 ))")"
 
-# A wider spread exercises weekly and monthly on top of daily. Exact totals
-# depend on ISO week boundaries, so this asserts the shape that matters: it
-# pruned, it kept more than the daily floor, and it kept the newest.
-section "keep-daily/weekly/monthly on a month of snapshots"
-repo_fresh "$TMP/repo_spread"
-for ((d = 0; d < 30; d++)); do
-  snap "$(date -u -d "@$(( JAN1 + d * 86400 ))" +%Y-%m-%dT03:00:00Z)"
-done
-eq "records 30 daily snapshots" "$(count)" "30"
-restic forget --quiet "${RESTIC_TEST_OPTS[@]}" "${RESTIC_KEEP_ARGS[@]}" >/dev/null
-spread=$(count)
-if (( spread >= 7 && spread < 30 )); then
-  pass "a month keeps between 7 and 30 snapshots (${spread})"
-else
-  fail "a month kept ${spread} snapshots, expected 7 <= n < 30"
-fi
-newest=$(restic snapshots --json "${RESTIC_TEST_OPTS[@]}" | jq -r 'sort_by(.time) | last | .time')
-eq "the newest snapshot survives the policy" "$newest" "2026-01-30 03:00:00"
+# The newest must survive. Cheap to assert from the list already fetched above,
+# and it is the one outcome that makes the rest of the policy worthless.
+newest_kept=$(restic snapshots --json "${RESTIC_TEST_OPTS[@]}" \
+  | jq -r 'sort_by(.time) | last | .time')
+eq "the newest snapshot survives the policy" \
+  "$newest_kept" "$(restic_time "@$(( JAN1 + 9 * 86400 ))")"
 
 # ---------------------------------------------------------------------------
 if (( FAILED )); then

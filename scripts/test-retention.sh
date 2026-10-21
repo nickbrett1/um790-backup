@@ -18,6 +18,21 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
+# UTC FOR THE WHOLE TEST, and it is load-bearing rather than tidy.
+#
+# `restic forget --keep-daily` buckets snapshots by LOCAL calendar day, not UTC.
+# This file used to create snapshots at 00:00Z..09:00Z and assert that they
+# collapsed to one, which is only true in UTC: on the build host (UTC-4) those
+# ten instants span Dec 31 20:00 through Jan 1 05:00 local, so restic correctly
+# kept TWO and the assertion failed. The test was wrong; restic was right.
+#
+# Pinning TZ makes the buckets deterministic here. Note the operational
+# consequence it hides: the real container must also run in UTC, or its own
+# keep-daily buckets will straddle two calendar days in the same way. That is a
+# property of restic, not of this script, and it is why the container must not
+# inherit a host timezone.
+export TZ=UTC
+
 SELF_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 # In the image the runner is installed on PATH; from a checkout it is a sibling.
@@ -180,7 +195,7 @@ snap() { # timestamp (any form date -d accepts)
   t=$(restic_time "$1")
   printf '%s\n' "$t" > "$SRC/payload"
   restic backup --quiet "${RESTIC_TEST_OPTS[@]}" \
-    --host "$(printf retention-test | cut -c1-27)" --time "$t" "$SRC" >/dev/null
+    --host retention-test --time "$t" "$SRC" >/dev/null
 }
 
 count() { restic snapshots --json "${RESTIC_TEST_OPTS[@]}" | jq 'length'; }
@@ -188,6 +203,10 @@ count() { restic snapshots --json "${RESTIC_TEST_OPTS[@]}" | jq 'length'; }
 # Ten snapshots inside a single calendar day. --keep-daily 7 keeps one per day,
 # so exactly one survives: if forget were a no-op (wrong args, failed call) the
 # count stays at 10 and this fails, which is what makes a green run meaningful.
+#
+# This only holds because TZ is pinned to UTC above - see the note there. Without
+# it the ten instants straddle two local calendar days and restic keeps two,
+# correctly.
 repo_fresh "$TMP/repo_same_day"
 for h in 00 01 02 03 04 05 06 07 08 09; do
   snap "2026-01-01T${h}:00:00Z"

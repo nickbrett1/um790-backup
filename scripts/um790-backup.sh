@@ -1,5 +1,4 @@
-#!/usr/bin/env bash
-# um790-backup — phase runner. ONE phase per invocation; Dagu or a human sequences
+#!/usr/bin/env bash# um790-backup — phase runner. ONE phase per invocation; Dagu or a human sequences
 # the phases. Everything here is safe to run by hand during an incident, which is
 # deliberate: the guards that matter must not live only inside a scheduler.
 #
@@ -60,10 +59,46 @@ CACHE="$BASE/cache"
 EXCLUDES_SRC="${EXCLUDES_SRC:-/app/deploy/exclude.txt}"
 EXCLUDES="${EXCLUDES:-$BASE/exclude.txt}"
 
-# Snapshot retention is COUNT-based against a WEEKLY prune: 8 snapshots ~= 8 weeks
-# of "undo a bad prune". This is a different axis from restic's own forget policy.
-KEEP_SNAPSHOTS="${KEEP_SNAPSHOTS:-8}"
-SNAPSHOT_RETENTION_DAYS="${SNAPSHOT_RETENTION_DAYS:-$((KEEP_SNAPSHOTS * 7))}"
+# ---------------------------------------------------------------------------
+# NAS snapshot retention
+# ---------------------------------------------------------------------------
+# TIME-BASED, EXPRESSED IN WEEKS, and deliberately NOT a bare count of snapshots.
+#
+# This used to be KEEP_SNAPSHOTS=8 with SNAPSHOT_RETENTION_DAYS=$((KEEP * 7)),
+# documented as "8 snapshots ~= 8 weeks of undo a bad prune". That `* 7` silently
+# asserts the schedule is WEEKLY. Point the DAG at a daily cron and 8 snapshots
+# becomes 8 DAYS of undo while every comment still says weeks - the window
+# shrinks by 7x and nothing complains.
+#
+# The number that has to be right is the DURATION, so the duration is what is
+# configured. A cadence change now moves the snapshot count (cost) instead of the
+# safety margin (the thing you find out about when you need it). Leave the DAG on
+# a weekly schedule and you neither pay more nor keep less.
+#
+# Scope: this governs the NAS-side Btrfs snapshots that `prune` sweeps. It is a
+# separate axis from restic's own --keep-daily/--keep-weekly policy inside the
+# repository, which is fixed in do_prune below.
+#
+# Deprecated alias: KEEP_SNAPSHOTS. It now means weeks, not a count, because
+# treating a stale count as a duration is exactly the bug above. Warn rather than
+# ignore, so an env var left over in the Dagu config cannot silently decide the
+# undo window.
+if [[ -n ${KEEP_SNAPSHOTS:-} ]]; then
+  printf '%s [validate] WARNING: KEEP_SNAPSHOTS is deprecated and now means WEEKS, not a snapshot count; use SNAPSHOT_RETENTION_WEEKS\n' \
+    "$(date -u +%FT%TZ)" >&2
+fi
+SNAPSHOT_RETENTION_WEEKS="${SNAPSHOT_RETENTION_WEEKS:-${KEEP_SNAPSHOTS:-8}}"
+SNAPSHOT_RETENTION_DAYS="${SNAPSHOT_RETENTION_DAYS:-$((SNAPSHOT_RETENTION_WEEKS * 7))}"
+
+# A sweep window shorter than a couple of run intervals keeps roughly one
+# snapshot, i.e. no undo at all. Not fatal (an operator may want it during a
+# migration), but it must not pass silently.
+if (( SNAPSHOT_RETENTION_DAYS < 14 )); then
+  printf '%s [validate] WARNING: SNAPSHOT_RETENTION_DAYS=%s keeps about one snapshot; there would be no previous point in time to undo to\n' \
+    "$(date -u +%FT%TZ)" "$SNAPSHOT_RETENTION_DAYS" >&2
+fi
+
+# 6h: prune must run within the same run as the snapshot it protects.
 SNAPSHOT_MAX_AGE="${SNAPSHOT_MAX_AGE:-$((6 * 3600))}"
 
 MAX_SOURCE_GB="${MAX_SOURCE_GB:-45}"
@@ -218,6 +253,7 @@ do_preflight() {
     log "dry-run: repo openable, source <= ${MAX_SOURCE_GB}G, then take the run lock"
     log "dry-run: repository=${RESTIC_REPOSITORY}"
     log "dry-run: staging=${STAGE} state=${STATE}"
+    log "dry-run: snapshot retention=${SNAPSHOT_RETENTION_DAYS}d (${SNAPSHOT_RETENTION_WEEKS} weeks)"
     return 0
   fi
 
@@ -553,7 +589,7 @@ do_prune() {
   names=$(snapshot_names | grep . || true)
   total=$(printf '%s\n' "$names" | grep -c . || true)
   total=${total:-0}
-  log "snapshots before sweep: ${total}"
+  log "snapshots before sweep: ${total} (retention ${SNAPSHOT_RETENTION_DAYS}d = ${SNAPSHOT_RETENTION_WEEKS} weeks)"
 
   local doomed=() name ep
   while read -r name; do
@@ -615,7 +651,8 @@ do_status() {
   "repo": "${RESTIC_REPOSITORY}",
   "snapshots": ${snapshots},
   "repo_bytes": ${bytes},
-  "duration_sec": ${duration}
+  "duration_sec": ${duration},
+  "snapshot_retention_days": ${SNAPSHOT_RETENTION_DAYS}
 }
 EOF
   mv -f "$tmp" "$STATE/last_success.json"
@@ -647,6 +684,7 @@ main() {
     log "validate-only: repository=${RESTIC_REPOSITORY}"
     log "validate-only: staging=${STAGE} state=${STATE}"
     log "validate-only: excludes=${EXCLUDES} (from ${EXCLUDES_SRC})"
+    log "validate-only: retention=${SNAPSHOT_RETENTION_DAYS}d (${SNAPSHOT_RETENTION_WEEKS} weeks)"
     return 0
   fi
 

@@ -19,6 +19,21 @@
 FROM debian:bookworm-slim
 WORKDIR /app
 
+# Run in UTC, EXPLICITLY. Debian's default is already UTC, but "default" is not
+# a guarantee: a bind-mounted /etc/localtime or a TZ in an env file would change
+# it, and the effect is silent.
+#
+# restic's --keep-daily buckets snapshots by LOCAL calendar day, so a non-UTC
+# container groups a 02:00 run into a different day than an 02:00+offset one.
+# The keep policy then drifts by up to a day depending on when the job fires -
+# no error, no warning, just a history that does not match the documented
+# "7 daily". scripts/test-retention.sh pins TZ for the same reason and asserts
+# the one-bucket-per-day behaviour this protects.
+#
+# It also keeps every log line and last_success.json timestamp comparable with
+# the NAS-side snapshot names, which are read as UTC by the sweep.
+ENV TZ=UTC
+
 # Link the GHCR container package to its GitHub repo on push. GHCR auto-links
 # the package to nickbrett1/um790-backup so it inherits the repo's access
 # (public repo -> public package; no manual visibility step).
@@ -26,7 +41,7 @@ LABEL org.opencontainers.image.source=https://github.com/nickbrett1/um790-backup
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       sqlite3 jq curl openssh-client ca-certificates coreutils \
-      docker.io bzip2 \
+      docker.io bzip2 tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # restic is installed at BUILD time, not from the entrypoint. Bookworm's own
@@ -48,6 +63,13 @@ COPY . .
 # pass and silently back up every Postgres data directory on /srv.
 RUN test -s deploy/exclude.txt \
     || { echo "FATAL: deploy/exclude.txt missing or empty - preflight would refuse to run" >&2; exit 1; }
+
+# The TZ above is a decision the backup depends on, so prove it in the build
+# rather than trusting the ENV line. If a future base image or apt layer changes
+# the effective zone, this goes red here instead of quietly re-bucketing the
+# retention policy months later.
+RUN test "$(date -u +%Y)" = "$(date +%Y)" \
+    || { echo "FATAL: container is not running in UTC - restic keep-daily would bucket by local day" >&2; exit 1; }
 
 COPY scripts/um790-backup.sh /usr/local/bin/um790-backup.sh
 RUN chmod +x /usr/local/bin/um790-backup.sh

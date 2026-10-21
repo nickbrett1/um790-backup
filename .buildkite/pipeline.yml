@@ -101,8 +101,20 @@ steps:
         # SIGINT does not run its EXIT trap, which is exactly how builders and
         # their multi-GB BuildKit state volumes leaked (mac-studio, 2026-09-23:
         # ~38 GiB of orphaned buildx_buildkit_*_state volumes).
+        #
+        # BUILDKITE ESCAPING, and this line got it wrong for a while: `$$` is
+        # how you emit one literal `$`. Writing `$$${BUILDX_BUILDER_NAME}` (three
+        # dollars) emits `$` and then lets Buildkite interpolate
+        # `${BUILDX_BUILDER_NAME}` ITSELF - which it cannot, because that
+        # variable is set inside this script, not in the agent environment. It
+        # resolves to empty and the shell receives `buildx_buildkit_$0_state`,
+        # where `$0` is the shell's own name. The volume command therefore never
+        # matched the real volume, which is a silent no-op dressed as cleanup -
+        # the exact leak this trap exists to prevent. `$${...}` is correct: `$$`
+        # becomes `$`, and `{...}` survives to the shell, which expands the
+        # name it actually set. Do not "fix" this back to three dollars.
         trap 'exit 143' TERM INT
-        trap 'docker buildx rm -f "$$BUILDX_BUILDER_NAME" >/dev/null 2>&1 || true; docker volume rm "buildx_buildkit_$$${BUILDX_BUILDER_NAME}0_state" >/dev/null 2>&1 || true' EXIT
+        trap 'docker buildx rm -f "$$BUILDX_BUILDER_NAME" >/dev/null 2>&1 || true; docker volume rm "buildx_buildkit_$${BUILDX_BUILDER_NAME}0_state" >/dev/null 2>&1 || true' EXIT
         # Skip if this commit is already published: the release step's ls-remote
         # guard, for an image. Only a positive answer skips - if the registry
         # cannot be reached the push still runs, because "could not ask" must

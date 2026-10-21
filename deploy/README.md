@@ -22,6 +22,10 @@ SHA and `latest`).
   - the resolved `GHCR_UPDATE_TOKEN` — a **classic** PAT with the
     `write:packages` scope, used to push to GHCR
 
+Publishing is gated, not automatic: `docker_publish` depends on the shell build,
+the batch smoke gate **and** the offline retention gate (§2b). An image whose
+retention decisions have not been exercised is not published at all.
+
 ### One-time CI setup (agent `environment` hook)
 
 Before the first push can publish an image, the agent must supply the registry
@@ -40,7 +44,46 @@ prerequisites.
 > GitHub **fine-grained** PATs cannot access the Container registry (GHCR)
 > yet, and offer no "Packages: read & write" permission — do not use one here.
 
-## 2. Run it
+### One-time CI setup (DAG pin bump)
+
+The `dagu_pin_bump` step opens a PR against `nickbrett1/dagu-dags` pinning the
+new SHA (§4). It needs one more secret, also in Doppler `common`/`prd`:
+
+- `DAGU_DAGS_TOKEN` — a **fine-grained** PAT scoped to `nickbrett1/dagu-dags`
+  with `Contents: read & write` and `Pull requests: read & write`.
+
+Fine-grained is correct *here* (unlike GHCR above): this is a git push plus a
+pull-request API call, not a package write, so it can be scoped to one
+repository. The step resolves it from Doppler at run time, so it is never in the
+agent's `environment` hook.
+
+## 2. Gates that run before publish
+
+**2a. Shell gate** — `shellcheck -x scripts/*.sh`, then the built image runs a
+phase with `--dry-run` and must exit 0. This proves the image starts and that the
+argv contract holds with no environment at all.
+
+**2b. Retention gate** — `scripts/test-retention.sh`, run inside the built image
+with `--network=none`. `--dry-run` cannot test retention: there is no NAS and no
+repository history in CI for a policy to select from, and that selection is the
+only part of `prune` that can lose data. So the gate drives the real code:
+
+- `select_sweep_candidates` against synthetic `synosharesnapshot` names — a
+  56-day window, the exact-cutoff boundary (56 kept, 57 deleted), unparseable
+  names left alone, and the rule that the newest snapshot is never deleted even
+  when every snapshot has expired;
+- the real `RESTIC_KEEP_ARGS` applied to throwaway **local** repositories with
+  backdated snapshots, asserting that ten same-day snapshots collapse to one and
+  that the newest survives the policy.
+
+It reads `RESTIC_KEEP_ARGS` from the runner rather than restating it, so changing
+the policy without thinking about its effect fails the gate.
+
+What this still does **not** cover: DSM. The real `synosharesnapshot list`
+output, the actual snapshot name format, and the delete call have never run
+against a NAS. Run the phases by hand once (§4) before enabling the schedule.
+
+## 3. Run it
 
 Always run with `--rm` and pin the commit SHA: an immutable image is the only
 thing that makes a scheduled run reproducible.
@@ -60,22 +103,47 @@ non-zero naming the missing path — a DAG/image mismatch then fails run #1 with
 `/backup: not found` instead of silently producing an empty backup. Keep the
 `-v` list in sync with the scheduler's definition.
 
-## 3. Compose (ad-hoc runs)
+## 4. Promotion, pinning and rollback
 
-`docker-compose.yml` is generated with `restart: "no"`, because a finished job
-must not be restarted by Docker. `docker compose run --rm app` is equivalent to
-the `docker run` above and reads the same `.env`.
+Every image is tagged with its commit SHA as well as `latest`. **Only the SHA is
+ever used to run it.**
 
-## 4. Rolling back / pinning a version
+Nobody edits the pin by hand any more. On a green `main` build, the
+`dagu_pin_bump` step runs `scripts/bump-dagu-pin.sh`, which:
 
-Every image is tagged with its commit SHA as well as `latest`. Both the
-scheduler and an ad-hoc run should pin the SHA:
+1. clones `nickbrett1/dagu-dags`,
+2. rewrites the single `UM790_BACKUP_IMAGE:` line in
+   `dags/ryzen/um790-backup.yaml.disabled`,
+3. asserts that **exactly two lines changed** before pushing (a `sed` that ran
+   away cannot reach the branch),
+4. force-updates one branch, `auto/um790-backup-pin`, so successive builds
+   refresh a single PR rather than leaving one branch per build, and
+5. opens the PR — or reports the one that is already open.
 
-1. Find the SHA of the last good commit (GHCR package page, or `git log`).
-2. Use `ghcr.io/nickbrett1/um790-backup:<commit-sha>`.
+The PR edits the **`.disabled`** file, so merging it sets the pin and does not
+start the schedule. Enabling stays a separate rename by a human, after the phases
+have been run by hand.
 
-There is **no Watchtower and no `latest` auto-update**, by design: a batch image
-must never change between runs without a reviewed commit, and never mid-run.
+Rollback, in order of preference:
+
+1. Revert the pin commit (or set the SHA back) — one line, takes effect on the
+   next invocation.
+2. If the bad image already ran `prune`, the undo is the NAS snapshot from
+   before it, not a re-deploy. `SNAPSHOT_RETENTION_WEEKS` is the window.
+
+There is **no Watchtower and no tag auto-update**, by design, and the reason is
+specific to this pipeline rather than general conservatism:
+
+- each phase is a separate `docker run --rm`, so an image that changes between
+  phases — or between a failed `prune` and its retry — makes the failure
+  unreproducible and the retry not identical;
+- `prune` can destroy snapshot history, and a bad pin costs a one-line revert
+  while a bad channel is already published by the time you notice.
+
+Watchtower would not even work here: it resolves tags and recreates running
+containers, and this is a digest-pinned batch job with no container to recreate.
+"Auto-pull" for this job is really just "drop the pin", which is the thing being
+declined.
 
 ## 5. Package visibility
 
@@ -106,6 +174,11 @@ Keys are derived from the `envVars` configuration; nothing is invented here.
 RESTIC_PASSWORD=
 NTFY_URL=
 ```
+
+Retention knobs are read by the runner and default to the documented contract;
+set them only to deviate from it. `SNAPSHOT_RETENTION_WEEKS` (default 8) is the
+NAS-side undo window and is deliberately independent of the schedule cadence, so
+a cron change cannot silently shrink it.
 
 ## 8. Networking
 

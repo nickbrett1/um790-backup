@@ -8,6 +8,12 @@
 # step runs it with --network=none, so a green result cannot depend on anything
 # outside this file and the runner it sources.
 #
+# This file found a real bug on its first run: snapshot_epoch rewrote every dot
+# in a snapshot name to a dash, including the time separators, so `date` rejected
+# the string and EVERY name parsed as empty. The sweep had never deleted a single
+# snapshot. Keep the parser cases below exactly as they are - they are the
+# regression test for that, and the reason a --dry-run gate was not enough.
+#
 # Run it by hand with: bash scripts/test-retention.sh
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -56,6 +62,10 @@ section() { printf '\n-- %s\n' "$*"; }
 # returns nothing: an empty result leaves a snapshot alone (safe), a wrong
 # number deletes one (not safe). So the negatives matter as much as the
 # positive, and the positive asserts an exact epoch rather than "not empty".
+#
+# The bug this section exists for: the old implementation produced an empty
+# epoch for EVERY name, including well-formed ones, because it dashed the time
+# separators. The first two cases are the ones that were failing in CI.
 section "snapshot_epoch"
 eq "parses a DSM snapshot name" \
   "$(snapshot_epoch 'GMT-04-2026.10.20-22.15.44')" \
@@ -63,10 +73,20 @@ eq "parses a DSM snapshot name" \
 eq "accepts a positive offset label" \
   "$(snapshot_epoch 'GMT+09-2026.01.02-03.04.05')" \
   "$(date -u -d '2026-01-02 03:04:05' +%s)"
+# Parsing is order-of-magnitude, not order-of-hours: the label is validated but
+# not applied, so the same wall-clock digits under a different label give the
+# same epoch. Asserted so a future "improvement" that applies the offset has to
+# come here and argue for it.
+eq "ignores the offset value, not just its presence" \
+  "$(snapshot_epoch 'GMT-11-2026.10.20-22.15.44')" \
+  "$(snapshot_epoch 'GMT+11-2026.10.20-22.15.44')"
 eq "rejects an unrecognised name" "$(snapshot_epoch 'snapshot-1')" ""
 eq "rejects a truncated name" "$(snapshot_epoch 'GMT-04-2026.10.20')" ""
 eq "rejects a name with no offset label" "$(snapshot_epoch '2026.10.20-22.15.44')" ""
 eq "rejects a name with a bad separator" "$(snapshot_epoch 'GMT-04-2026-10-20-22.15.44')" ""
+# The old sed-based prefix strip would have accepted this - the label was
+# optional in that pattern. Anchoring is what makes it rejected now.
+eq "rejects an offset label of the wrong width" "$(snapshot_epoch 'GMT-4-2026.10.20-22.15.44')" ""
 
 # ---------------------------------------------------------------------------
 # 2. select_sweep_candidates — what the sweep deletes
@@ -117,6 +137,13 @@ eq "ignores an unparseable name" \
 eq "deletes nothing from an empty list" \
   "$(printf '' | sweep 56)" ""
 
+# NOT a bug, and pinned so nobody "fixes" it: when EVERY name is unparseable the
+# selector deletes nothing and says nothing on stdout. That is the right answer
+# here - the parser cannot safely guess - and the runner is where it is turned
+# into a failure, via the "parsed 0 of N names" guard in do_prune.
+eq "deletes nothing when every name is unparseable" \
+  "$(printf 'junk\nrubbish\n' | sweep 56)" ""
+
 # ---------------------------------------------------------------------------
 # 3. RESTIC_KEEP_ARGS — what the repository policy keeps
 # ---------------------------------------------------------------------------
@@ -137,10 +164,23 @@ repo_fresh() { # path
 SRC=$TMP/src
 mkdir -p "$SRC"
 
-snap() { # rfc3339 timestamp
-  printf '%s\n' "$1" > "$SRC/payload"
+# restic's --time is NOT RFC3339. It parses with the layout
+# "2006-01-02 15:04:05", so a "2026-01-01T00:00:00Z" argument fails the whole
+# command with "error in time option: ... cannot parse ... as ' '". The first
+# version of this test passed RFC3339 and died on it, which is a bug in the test
+# rather than in the runner - the runner never passes --time. Converted in one
+# place, and the layout is asserted once so a future edit cannot silently
+# reintroduce it.
+restic_time() { date -u -d "$1" +'%Y-%m-%d %H:%M:%S'; }
+eq "restic_time renders restic's layout, not RFC3339" \
+  "$(restic_time '2026-01-01T00:00:00Z')" "2026-01-01 00:00:00"
+
+snap() { # timestamp (any form date -d accepts)
+  local t
+  t=$(restic_time "$1")
+  printf '%s\n' "$t" > "$SRC/payload"
   restic backup --quiet "${RESTIC_TEST_OPTS[@]}" \
-    --host retention-test --time "$1" "$SRC" >/dev/null
+    --host "$(printf retention-test | cut -c1-27)" --time "$t" "$SRC" >/dev/null
 }
 
 count() { restic snapshots --json "${RESTIC_TEST_OPTS[@]}" | jq 'length'; }
@@ -175,7 +215,7 @@ else
   fail "daily spread kept ${spread} snapshots, expected 7 <= n < 30"
 fi
 newest=$(restic snapshots --json "${RESTIC_TEST_OPTS[@]}" | jq -r 'sort_by(.time) | last | .time')
-eq "the newest snapshot survives the policy" "$newest" "2026-01-30T03:00:00Z"
+eq "the newest snapshot survives the policy" "$newest" "2026-01-30 03:00:00"
 
 # ---------------------------------------------------------------------------
 if (( FAILED )); then

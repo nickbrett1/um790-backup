@@ -41,6 +41,14 @@ RUN chmod +x /usr/local/bin/install-restic.sh \
 
 COPY . .
 
+# preflight installs /app/deploy/exclude.txt into the state mount and refuses to
+# run without it, so an image missing that file can only fail - at 02:00, on the
+# host, under a taken lock. Assert it here instead, where the build goes red and
+# nobody has to be woken up. `-s` not `-e`: an empty exclude list would otherwise
+# pass and silently back up every Postgres data directory on /srv.
+RUN test -s deploy/exclude.txt \
+    || { echo "FATAL: deploy/exclude.txt missing or empty - preflight would refuse to run" >&2; exit 1; }
+
 COPY scripts/um790-backup.sh /usr/local/bin/um790-backup.sh
 RUN chmod +x /usr/local/bin/um790-backup.sh
 

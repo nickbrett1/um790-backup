@@ -245,10 +245,32 @@ snapshot_count() {
 # Snapshot names look like GMT-04-2026.10.20-22.15.44. Age is computed from the
 # timestamp part rather than from list order, because DSM's ordering is not
 # documented and the design's `--reverse | tail -n +N` assumed it was.
+#
+# THE WHOLE NAME IS MATCHED IN ONE REGEX, and the separators are explicit. The
+# previous version stripped the offset prefix with sed and then rewrote EVERY dot
+# to a dash, which also rewrote the three time separators and handed `date` a
+# string it cannot parse ("2026-10-20-22-15-44"). The result was empty for every
+# real snapshot name, so select_sweep_candidates treated every snapshot as
+# unparseable and the sweep deleted nothing, forever, while logging a warning per
+# snapshot. Caught by scripts/test-retention.sh on its first run.
+#
+# Anchoring the offset label is load-bearing too: matching the bare
+# YYYY.MM.DD-HH.MM.SS shape would accept a name with no label at all.
+#
+# The GMT±NN label is validated but NOT applied - the timestamp is read as UTC. A
+# few hours cannot move a 56-day cutoff, and applying it would make the sweep
+# depend on a label the NAS is free to write differently.
+#
+# Always returns 0. It is called as `ep=$(snapshot_epoch ...)` under `set -e`,
+# where a non-zero status would kill the shell instead of reading as
+# "unparseable".
 snapshot_epoch() { # name -> epoch, empty on parse failure
-  local name=$1 ts
-  ts=$(sed -E 's/^GMT[+-][0-9]{2}-//' <<<"$name")
-  date -u -d "${ts//./-}" +%s 2>/dev/null || true
+  local name=$1
+  if [[ $name =~ ^GMT[+-][0-9]{2}-([0-9]{4})\.([0-9]{2})\.([0-9]{2})-([0-9]{2})\.([0-9]{2})\.([0-9]{2})$ ]]; then
+    # date reads "YYYY-MM-DD HH:MM:SS" in UTC (-u), so no offset surprises.
+    date -u -d "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}" +%s 2>/dev/null || true
+  fi
+  return 0
 }
 
 # Which snapshots the sweep may delete: a pure function of (now, window, names),
@@ -657,6 +679,21 @@ do_prune() {
     # so there is always a point in time left to restore to.
     mapfile -t doomed < <(printf '%s\n' "$names" \
       | select_sweep_candidates "$(stamp)" "$SNAPSHOT_RETENTION_DAYS")
+  fi
+
+  # A sweep that parsed NOTHING while there were names to parse is a parser
+  # failure, not a no-op, and it fails silently in the direction of "safety"
+  # (nothing deleted) while snapshots accumulate forever. The count is the only
+  # place that is visible, so it is asserted here.
+  if (( total > 0 )) && (( ${#doomed[@]} == 0 )); then
+    local parsed
+    parsed=$(printf '%s\n' "$names" | while read -r n; do
+      [[ -n $n ]] || continue
+      [[ -n $(snapshot_epoch "$n") ]] && printf 'x'
+    done | grep -c x || true)
+    if (( ${parsed:-0} == 0 )); then
+      die "parsed 0 of ${total} snapshot names — the sweep would delete nothing; check the name format against synosharesnapshot list output"
+    fi
   fi
 
   if (( ${#doomed[@]} == 0 )); then

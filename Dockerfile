@@ -23,15 +23,20 @@ WORKDIR /app
 # a guarantee: a bind-mounted /etc/localtime or a TZ in an env file would change
 # it, and the effect is silent.
 #
-# restic's --keep-daily buckets snapshots by LOCAL calendar day, so a non-UTC
-# container groups a 02:00 run into a different day than an 02:00+offset one.
-# The keep policy then drifts by up to a day depending on when the job fires -
-# no error, no warning, just a history that does not match the documented
-# "7 daily". scripts/test-retention.sh pins TZ for the same reason and asserts
-# the one-bucket-per-day behaviour this protects.
+# The reason is comparability, not a claim about restic internals: snapshot
+# names printed by DSM are UTC wall-clock, and the sweep parses them as UTC. If
+# the container formatted timestamps in a host zone, log lines and
+# last_success.json would be offset from the names they refer to, and reading a
+# run log against a snapshot list would require mental arithmetic. A fixed zone
+# also makes output reproducible between the build host and the NAS.
 #
-# It also keeps every log line and last_success.json timestamp comparable with
-# the NAS-side snapshot names, which are read as UTC by the sweep.
+# Deliberately NOT claimed here: that restic's --keep-daily buckets by local
+# calendar day and therefore needs UTC to be correct. That was asserted once in
+# this file's history and it did not survive testing - pinning TZ=UTC did not
+# change a same-day keep-daily result, so it was never established as the cause.
+# The retention test now asserts keep-daily over consecutive days, which is
+# stable under any uniform offset, so it tests the policy without depending on
+# this explanation being true. Do not reintroduce the claim without evidence.
 ENV TZ=UTC
 
 # Link the GHCR container package to its GitHub repo on push. GHCR auto-links
@@ -66,10 +71,11 @@ RUN test -s deploy/exclude.txt \
 
 # The TZ above is a decision the backup depends on, so prove it in the build
 # rather than trusting the ENV line. If a future base image or apt layer changes
-# the effective zone, this goes red here instead of quietly re-bucketing the
-# retention policy months later.
-RUN test "$(date -u +%Y)" = "$(date +%Y)" \
-    || { echo "FATAL: container is not running in UTC - restic keep-daily would bucket by local day" >&2; exit 1; }
+# the effective zone, this goes red here instead of quietly offsetting every
+# timestamp months later. Compares the zone OFFSET (via %z), which is what
+# actually breaks: a same-year comparison passes for any whole-hour offset.
+RUN test "$(date +%z)" = "+0000" \
+    || { echo "FATAL: container is not running in UTC - log timestamps would not match UTC snapshot names" >&2; exit 1; }
 
 COPY scripts/um790-backup.sh /usr/local/bin/um790-backup.sh
 RUN chmod +x /usr/local/bin/um790-backup.sh

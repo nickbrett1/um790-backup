@@ -14,11 +14,18 @@
 # snapshot. Keep the parser cases below exactly as they are - they are the
 # regression test for that, and the reason a --dry-run gate was not enough.
 #
-# COST, because it is a real constraint: every keep-policy case backs up into a
-# real repository, so each one costs a restic invocation and the whole file is
-# the slowest step in CI. It was 40-odd backups and doubled the queue; the
-# month-long case was cut for that reason. Add a case only if it can fail in a
-# way the existing ones cannot, and keep the snapshot count in it small.
+# COST, because it is a real constraint: every keep-policy snapshot is a real
+# restic backup, and this step is the slowest in CI. It is currently 10 backups.
+# Add a case only if it can fail in a way the existing ones cannot, and keep its
+# snapshot count small.
+#
+# A note on how the keep-policy expectations here were arrived at. The first two
+# versions of them were guesses, and both were wrong in CI: one assumed ten
+# same-day snapshots would collapse to one (they did not), the other assumed the
+# surviving count would equal --keep-daily (it does not - see section 3). This
+# section now asserts structure that follows from documented behaviour (the union
+# of the policies, and daily covering the last 7 days) rather than an exact count
+# derived from reading the arguments.
 #
 # Run it by hand with: bash scripts/test-retention.sh
 set -Eeuo pipefail
@@ -195,6 +202,18 @@ snap() { # timestamp (any form date -d accepts)
 
 count() { restic snapshots --json "${RESTIC_TEST_OPTS[@]}" | jq 'length'; }
 
+# READ-BACK FORMAT: `restic snapshots --json` reports .time as RFC3339 with a Z
+# ("2026-01-01T03:00:00Z"), NOT in the --time input layout. Comparing that
+# against restic_time() output fails on the format alone while the timestamp is
+# correct - which is exactly what happened in build 35. Every comparison below
+# goes through epoch seconds, so the two formats never meet.
+kept_epochs() {
+  restic snapshots --json "${RESTIC_TEST_OPTS[@]}" \
+    | jq -r '.[].time' \
+    | while read -r t; do date -u -d "$t" +%s; done \
+    | sort -n
+}
+
 # WHY THIS ONE CASE, ON DISTINCT CONSECUTIVE DAYS AT A FIXED HOUR.
 #
 # A previous version put ten snapshots inside ONE calendar day (00:00Z..09:00Z)
@@ -214,51 +233,78 @@ count() { restic snapshots --json "${RESTIC_TEST_OPTS[@]}" | jq 'length'; }
 # makes this an assertion about the POLICY rather than about the build machine's
 # clock.
 #
-# WHY THERE IS NO SEPARATE --keep-weekly / --keep-monthly CASE.
+# WHAT `forget` ACTUALLY KEEPS, and why the assertions are shaped this way.
 #
-# There was one - 30 daily snapshots, asserting a month keeps between 7 and 30 -
-# and it was cut because it cost 30 real backups to re-test a property that
-# cannot differ here. With one run per day every snapshot is on its own calendar
-# day, so keep-daily 7 alone already retains the newest seven DISTINCT days; each
-# day is distinct by construction, so weekly and monthly can only re-select
-# snapshots daily has already kept. They add nothing to the count, and a 30-day
-# case proved only that forget prunes at all - which this case already proves
-# with 10.
+# restic keeps the UNION of the policies, not the intersection and not just the
+# most specific one. With --keep-daily 7 --keep-weekly 4 --keep-monthly 6 over ten
+# consecutive days, it keeps the last 7 days PLUS one representative from the
+# earlier calendar week - 8 snapshots, and the oldest survivor is OLDER than the
+# daily window. Build 35 asserted exactly 7 and failed with 8.
 #
-# They are NOT dead config: they matter if the cadence ever becomes more frequent
-# than daily, where daily collapses to one per day and weekly/monthly are what
-# hold the older history. That is a cadence we do not have. If the DAG schedule
-# changes, this is the comment to revisit.
+# That extra survivor is the entire point of --keep-weekly: it extends history
+# beyond the daily window. So this case covers weekly/monthly after all, and does
+# it in 10 backups - which is why a separate 30-snapshot case was cut. When this
+# case was first written the claim was the opposite ("weekly cannot raise the
+# count"); the build disproved it, so the assertions now prove the extension
+# rather than assume it away.
+#
+# Deliberately does NOT assert an exact surviving count: 8 here depends on which
+# calendar week the month starts in, so it would be a date-dependent number
+# dressed up as a policy fact. The properties asserted below follow from the
+# documented behaviour and hold whatever day of the week the fixture starts on.
 section "keep-daily on consecutive days"
 
 repo_fresh "$TMP/repo_daily"
 JAN1=$(date -u -d '2026-01-01 03:00:00' +%s)
+day_epoch() { printf '%s' "$(( JAN1 + $1 * 86400 ))"; }   # 0-based day offset
 for ((d = 0; d < 10; d++)); do
-  snap "$(date -u -d "@$(( JAN1 + d * 86400 ))" +%Y-%m-%dT03:00:00Z)"
+  snap "$(date -u -d "@$(day_epoch "$d")" +%Y-%m-%dT03:00:00Z)"
 done
 eq "records 10 consecutive daily snapshots" "$(count)" "10"
 
 restic forget --quiet "${RESTIC_TEST_OPTS[@]}" "${RESTIC_KEEP_ARGS[@]}" >/dev/null
 
-# --keep-daily 7 over ten days with one snapshot each keeps exactly the newest
-# seven. If forget were a no-op (wrong args, swallowed failure) the count stays
-# at 10, so a green here is real evidence the policy ran.
-eq "keep-daily 7 keeps the newest 7 of 10 consecutive days" "$(count)" "7"
+mapfile -t KEPT < <(kept_epochs)
+n_kept=${#KEPT[@]}
 
-# The seven that survive must be the most RECENT seven, not an arbitrary seven.
-# Counting alone would pass if forget kept seven ancient snapshots and deleted
-# the newest - the exact failure the sweep's positional bug had.
-oldest_kept=$(restic snapshots --json "${RESTIC_TEST_OPTS[@]}" \
-  | jq -r 'sort_by(.time) | first | .time')
-eq "the survivors are the newest seven, so the oldest kept is day 4" \
-  "$oldest_kept" "$(restic_time "@$(( JAN1 + 3 * 86400 ))")"
+# It must have pruned at all: if forget were a no-op (wrong args, swallowed
+# failure) the count stays at 10 and every assertion below still passes on the
+# untouched repo. So the pruning itself is asserted first.
+if (( n_kept < 10 )); then
+  pass "forget pruned the repository (${n_kept} of 10 survived)"
+else
+  fail "forget kept all 10 snapshots - it did not prune, so nothing below is meaningful"
+fi
 
-# The newest must survive. Cheap to assert from the list already fetched above,
-# and it is the one outcome that makes the rest of the policy worthless.
-newest_kept=$(restic snapshots --json "${RESTIC_TEST_OPTS[@]}" \
-  | jq -r 'sort_by(.time) | last | .time')
+# keep-daily 7 keeps the last seven DAYS, so days 3..9 (0-based) must survive.
+# Asserted individually rather than as a count: a count of 8 would also pass if
+# forget kept one day twice and dropped another.
+missing=0
+for ((d = 3; d < 10; d++)); do
+  want=$(day_epoch "$d")
+  if printf '%s\n' "${KEPT[@]}" | grep -qx "$want"; then
+    :
+  else
+    fail "day ${d} is missing but keep-daily 7 should retain it"
+    missing=1
+  fi
+done
+(( missing )) || pass "all 7 days of the keep-daily window survive"
+
+# The newest snapshot must survive. This is the one outcome that makes the rest
+# of the policy worthless if it is wrong.
 eq "the newest snapshot survives the policy" \
-  "$newest_kept" "$(restic_time "@$(( JAN1 + 9 * 86400 ))")"
+  "${KEPT[-1]}" "$(day_epoch 9)"
+
+# And at least one snapshot OLDER than the daily window must survive, which is
+# --keep-weekly doing its job. Without this the policy would be indistinguishable
+# from --keep-daily 7 alone, and the weekly/monthly args could be deleted with no
+# test noticing.
+if (( KEPT[0] < $(day_epoch 3) )); then
+  pass "weekly/monthly extend history past the daily window (oldest kept predates it)"
+else
+  fail "nothing older than the daily window survived - keep-weekly/keep-monthly are not taking effect"
+fi
 
 # ---------------------------------------------------------------------------
 if (( FAILED )); then

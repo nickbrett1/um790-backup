@@ -248,7 +248,9 @@ do_preflight() {
     || die "exclude list ${EXCLUDES_SRC} is empty — refusing to run with no excludes"
   install -m 0644 "$EXCLUDES_SRC" "$EXCLUDES" \
     || die "cannot install ${EXCLUDES_SRC} -> ${EXCLUDES}"
-  log "installed exclude list ($(grep -c . "$EXCLUDES" || true) patterns) -> ${EXCLUDES}"
+  # Count real patterns, not blank lines and not the explanatory comments: a
+  # "36 patterns" log line that is mostly prose is worse than no number at all.
+  log "installed exclude list ($(grep -cvE '^[[:space:]]*(#|$)' "$EXCLUDES" || true) patterns) -> ${EXCLUDES}"
 
   # A lock from a crashed run must not block forever, but a lock that is hours old
   # is more likely a genuinely stuck run than a corpse.

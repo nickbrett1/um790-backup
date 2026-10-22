@@ -278,18 +278,18 @@ fi
 
 # keep-daily 7 keeps the last seven DAYS, so days 3..9 (0-based) must survive.
 # Asserted individually rather than as a count: a count of 8 would also pass if
-# forget kept one day twice and dropped another.
-missing=0
+# forget kept one day twice and dropped another. Collecting the misses rather
+# than setting a flag means the failure names the days that went missing.
+dropped=()
 for ((d = 3; d < 10; d++)); do
   want=$(day_epoch "$d")
-  if printf '%s\n' "${KEPT[@]}" | grep -qx "$want"; then
-    :
-  else
-    fail "day ${d} is missing but keep-daily 7 should retain it"
-    missing=1
-  fi
+  printf '%s\n' "${KEPT[@]}" | grep -qx "$want" || dropped+=("day $d")
 done
-(( missing )) || pass "all 7 days of the keep-daily window survive"
+if (( ${#dropped[@]} == 0 )); then
+  pass "all 7 days of the keep-daily window survive"
+else
+  fail "keep-daily 7 dropped snapshots it should retain: ${dropped[*]}"
+fi
 
 # The newest snapshot must survive. This is the one outcome that makes the rest
 # of the policy worthless if it is wrong.

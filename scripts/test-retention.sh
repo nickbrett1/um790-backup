@@ -342,15 +342,22 @@ esac
 eq "builds the exact argv for two names" "$dcmd" \
   "sudo -n /usr/syno/sbin/synosharesnapshot delete 'restic-target' '$n1' '$n2'"
 
-# Word count read the way the shell reads it: split on SPACES, not on the caller's
-# IFS, because that is what decides how many argv words the remote side receives.
-# 4 words of the command path + the share + 2 names = 7. Asserted separately from
-# the string equality because a name containing a space would keep the text
-# looking right while the quoting was already lost.
-wordcount() { ( set -f; IFS=' '; set -- $1; printf '%s' "$#" ); }
-# shellcheck disable=SC2086  # the unquoted expansion IS the word splitting under test
-wc7=$(wordcount "$dcmd")
-eq "two names split into 7 shell words" "$wc7" "7"
+# Word count read the way the remote shell reads it: split on SPACES, not on the
+# caller's IFS, because that is what decides how many argv words arrive. 4 words
+# of the command path + the share + 2 names = 7. Asserted separately from the
+# string equality because a name containing a space would keep the text looking
+# right while the quoting was already lost.
+#
+# read -ra rather than an unquoted expansion: the split IS the assertion, and the
+# build step runs `shellcheck -x scripts/*.sh`, where an unquoted expansion is
+# SC2086. This form is clean under the linter by construction rather than by a
+# disable directive.
+wordcount() { # $1 -> number of space-separated words
+  local -a w=()
+  IFS=' ' read -r -a w <<< "$1"
+  printf '%s' "${#w[@]}"
+}
+eq "two names split into 7 shell words" "$(wordcount "$dcmd")" "7"
 
 eq "a single name is unaffected (the case that always worked)" \
   "$(snapshot_delete_cmd 'restic-target' "$n1")" \
@@ -359,8 +366,8 @@ eq "a single name is unaffected (the case that always worked)" \
 # A third name must widen the argv, not corrupt it. This is the "N > 2" case the
 # original bug needed and never had.
 n3='GMT-04-2026.10.22-12.08.15'
-wc3=$(wordcount "$(snapshot_delete_cmd 'restic-target' "$n1" "$n2" "$n3")")
-eq "three names split into 8 shell words" "$wc3" "8"
+eq "three names split into 8 shell words" \
+  "$(wordcount "$(snapshot_delete_cmd 'restic-target' "$n1" "$n2" "$n3")")" "8"
 
 # THE REFUSAL. A name containing a single quote cannot be wrapped safely for the
 # remote shell without %q (bash-only, and the remote login shell is not ours to

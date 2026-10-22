@@ -135,6 +135,28 @@ SQLITE_DBS=(
   "/srv/reader/vg-books/reader.db|vg-books"
 )
 
+# SQLite files that ARE in the backup set but are NOT live databases: frozen
+# pre-migration copies sitting in a backups/ directory.
+#
+# They need their own category because the drift scan below exists to catch a live
+# database whose raw file restic would copy mid-transaction. These are the opposite
+# case - nothing has them open, the file is complete, and a byte-for-byte copy is
+# the CORRECT thing to keep. Adding them to SQLITE_DBS would dump a copy of a copy
+# (VACUUM INTO of an already-static file), which is pure waste and adds a failure
+# mode; excluding them would discard the only copy of the pre-migration state.
+#
+# Bash patterns, matched against the find output. Verified on 2026-10-22 against
+# real state: two files, 240,058,368B each, identical size but different sha256,
+# mtime ~58.7 days older than mailroom.db, nothing holding either open.
+STATIC_SQLITE=(
+  "/srv/docker/mailroom/backups/mailroom_pre_*.db"
+)
+
+# The exemption's whole justification is "nothing is writing to it", and that can
+# stop being true. A file rewritten inside this window is reported, because restic
+# would then be copying a live file while calling it static.
+STATIC_SQLITE_MAX_AGE_DAYS="${STATIC_SQLITE_MAX_AGE_DAYS:-7}"
+
 DRY_RUN=0
 PHASE=""
 
@@ -531,7 +553,7 @@ do_dumps() {
   if [[ $DRY_RUN == 1 ]]; then
     log "dry-run: would pg_dump ${#PG_CONTAINERS[@]} containers: ${PG_CONTAINERS[*]}"
     log "dry-run: would .backup + VACUUM INTO ${#SQLITE_DBS[@]} SQLite DBs, then integrity_check each copy"
-    log "dry-run: would fail on any >10M *.db under /srv that is not on the list and not excluded (drift hole)"
+    log "dry-run: would fail on any >10M *.db under /srv that is not on the list, not STATIC_SQLITE, and not excluded (drift hole)"
     return 0
   fi
 
@@ -596,7 +618,7 @@ do_dumps() {
   # NOTE: written as `if`, not `[[ ]] && known=1` - under `set -e` a failing
   # AND-list as the last command in a loop body exits the shell silently, which
   # would kill this phase with no message on the first non-matching entry.
-  local f known e
+  local f known e static_hit
   while read -r f; do
     [[ -n $f ]] || continue
     known=0
@@ -606,11 +628,45 @@ do_dumps() {
       fi
     done
     if (( ! known )); then
-      die "undiscovered SQLite >10M in the backup set: ${f} — add it to SQLITE_DBS (or, if it is a copy that need not be backed up, exclude it in deploy/exclude.txt)"
+      # A frozen pre-migration copy satisfies the check by being categorically
+      # different from a live database, not by being excused from coverage: it is
+      # still backed up, verbatim, by the restic run in do_backup.
+      static_hit=0
+      for e in "${STATIC_SQLITE[@]}"; do
+        # $e unquoted so the pattern glob-expands against the path.
+        if [[ $f == $e ]]; then
+          static_hit=1
+        fi
+      done
+      if (( ! static_hit )); then
+        die "undiscovered SQLite >10M in the backup set: ${f} — add it to SQLITE_DBS if it is live, or to STATIC_SQLITE if it is a frozen copy that needs no dump, or exclude it in deploy/exclude.txt if it need not be backed up at all"
+      fi
     fi
   done < <(find /srv -xdev \
              \( "${EXCLUDE_OR[@]}" -o -path "$STAGE" -o -path "$BASE" \) -prune -o \
              -type f -name '*.db' -size +10M -print 2>/dev/null || true)
+
+  # The STATIC_SQLITE exemption rests entirely on "nothing writes to this file", and
+  # that premise can quietly stop holding - at which point the entry keeps its
+  # exemption and restic starts copying a live database mid-write while the scan
+  # above says there is nothing to see. mtime is the only evidence available from
+  # inside the container: /proc here shows container processes only, so "is a host
+  # process holding the fd open" is not answerable, but a recently written file is.
+  #
+  # WARNING, not fatal: a freshly taken pre-migration copy is complete rather than
+  # torn, and failing the run for the legitimate case would train people to widen
+  # the exemption. The operator reading this line is the check.
+  local m mt age
+  for e in "${STATIC_SQLITE[@]}"; do
+    for m in $e; do
+      [[ -f $m ]] || continue
+      mt=$(stat -c %Y "$m" 2>/dev/null) || continue
+      age=$(( $(stamp) - mt ))
+      if (( age < STATIC_SQLITE_MAX_AGE_DAYS * 86400 )); then
+        log "WARNING: ${m} matches a STATIC_SQLITE exemption but was written ${age}s ago (limit $(( STATIC_SQLITE_MAX_AGE_DAYS * 86400 ))s) — if something now maintains it, move it to SQLITE_DBS so it gets dumped"
+      fi
+    done
+  done
 
   log "dumps ok"
 }

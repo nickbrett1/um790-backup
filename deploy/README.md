@@ -26,6 +26,14 @@ Publishing is gated, not automatic: `docker_publish` depends on the shell build,
 the batch smoke gate **and** the offline retention gate (§2b). An image whose
 retention decisions have not been exercised is not published at all.
 
+Note the asymmetry, because it has bitten this pipeline: `docker_publish` running
+green means the image **exists**. It does not mean the host will use it. Only the
+`dagu_pin_bump` step (§4) makes it reachable, and a bump that fails after a
+successful publish leaves a green image that nothing points at. On 2026-10-22
+build 54 did exactly that — published the mailroom sqlite fix, then died on a
+stale DAG path — so "the fix is deployed" and "the pipeline is red" were both
+true at once.
+
 ### One-time CI setup (agent `environment` hook)
 
 Before the first push can publish an image, the agent must supply the registry
@@ -83,6 +91,13 @@ What this still does **not** cover: DSM. The real `synosharesnapshot list`
 output, the actual snapshot name format, and the delete call have never run
 against a NAS. Run the phases by hand once (§4) before enabling the schedule.
 
+The same blind spot applies to `dumps`: the smoke gate returns before any phase
+body runs, so the sqlite path has no CI coverage at all. Both of the last two
+`dumps` defects (a quoted glob that made the `STATIC_SQLITE` exemption match
+nothing, and the mailroom WAL/`CANTOPEN` fallback) lived in code no test
+executes. Treat a hand-run against a database in the failing state as the test,
+not a formality.
+
 ## 3. Run it
 
 Always run with `--rm` and pin the commit SHA: an immutable image is the only
@@ -123,6 +138,18 @@ non-zero naming the missing path — a DAG/image mismatch then fails run #1 with
 `/backup: not found` instead of silently producing an empty backup. Keep the
 `-v` list in sync with the scheduler's definition.
 
+### `/srv` is `ro`, and one phase has to write
+
+`/srv:ro` is deliberate and stays. A backup must not perturb what it backs up,
+and the phases only ever read from the source. The one apparent exception proves
+the rule: `dumps` cannot open a WAL-mode database whose writers are short-lived,
+because with no `-wal` present SQLite must create the `-shm` and `:ro` returns
+`EROFS` (`SQLITE_CANTOPEN`, 14 — not `SQLITE_BUSY`, 5). The fix does not widen
+the mount. It copies main **and** `-wal` into writable staging and dumps from the
+copy, so the live file is never opened writable and never checkpointed. If you
+are tempted to mount a data directory `rw` to make a dump work, that is the thing
+this design declines.
+
 ### `MAX_SOURCE_GB`
 
 The source-size guard, in whole gigabytes, measured on `/srv` **with the exclude
@@ -147,16 +174,36 @@ Nobody edits the pin by hand any more. On a green `main` build, the
 
 1. clones `nickbrett1/dagu-dags`,
 2. rewrites the single `UM790_BACKUP_IMAGE:` line in
-   `dags/ryzen/um790-backup.yaml.disabled`,
+   `dags/ryzen/um790-backup.yaml`,
 3. asserts that **exactly two lines changed** before pushing (a `sed` that ran
    away cannot reach the branch),
 4. force-updates one branch, `auto/um790-backup-pin`, so successive builds
    refresh a single PR rather than leaving one branch per build, and
 5. opens the PR — or reports the one that is already open.
 
-The PR edits the **`.disabled`** file, so merging it sets the pin and does not
-start the schedule. Enabling stays a separate rename by a human, after the phases
-have been run by hand.
+The PR changes an image tag and nothing else. That DAG carries **no schedule key
+at all**, so a merged bump cannot put a timer on the host; the ability to schedule
+is a property of the definition, not permission granted by a filename. Adding the
+schedule stays a separate, deliberate edit by a human, after the phases have been
+run by hand.
+
+**Do not treat a `.disabled` filename as a safety net.** This pipeline used that
+suffix for a while and it was neither reviewable nor enforced. Dagu 2.21.0
+discovers `*.yaml`/`*.yml` only, so `um790-backup.yaml.disabled` matched nothing
+and never appeared in `dagu ls` — but it stayed reachable by absolute path, and on
+2026-10-22 it was run five times by hand. Two things follow, and both are why the
+suffix is gone:
+
+- a file `dagu` can execute but cannot discover makes "what can run?" unanswerable
+  from `dagu ls`;
+- renaming it is not a disable. `dagu suspend um790-backup` is.
+
+The pin is also live within about a minute of merging, with nobody pulling on the
+host: `dagu-dags-autocommit` fetches, rebases and pushes every minute, which means
+it pulls too. There is no window in which a human notices a bad pin before it
+runs. That is why the script refuses to move the pin backwards (a retried or
+out-of-order build is normal here — build 40 was itself a retry), and why the
+guard asks the GitHub compare API rather than local git.
 
 Rollback, in order of preference:
 

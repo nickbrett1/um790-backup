@@ -111,7 +111,17 @@ SNAPSHOT_MAX_AGE="${SNAPSHOT_MAX_AGE:-$((6 * 3600))}"
 # restated the policy would drift from it silently.
 RESTIC_KEEP_ARGS=(--keep-daily 7 --keep-weekly 4 --keep-monthly 6)
 
-MAX_SOURCE_GB="${MAX_SOURCE_GB:-45}"
+# The size guard catches a WRONG MOUNT, not normal growth. It is measured with the
+# exclude list applied (see measure_source_gb), because the raw /srv total includes
+# ~19G that never enters the repository - /srv/backups, /srv/marketdata, the
+# Postgres clusters, caches and Dagu's own state. Guarding on the raw number meant
+# a correct source failed a limit derived from the payload size, so the limit had
+# to be set above a quantity it was never describing.
+#
+# 70G against a ~45G payload: generous enough that a few hundred GB of new data
+# does not page anyone, small enough that "the whole disk got mounted at /srv"
+# (hundreds of GB, and -xdev does not save you from a bind mount) still fails.
+MAX_SOURCE_GB="${MAX_SOURCE_GB:-70}"
 EXPECTED_MIN_CONTAINERS="${EXPECTED_MIN_CONTAINERS:-60}"
 CHECK_READ_SUBSET="${CHECK_READ_SUBSET:-10%}"    # weekly cadence, so 10% each run
 
@@ -229,6 +239,66 @@ require_cmds() {
   fi
 }
 
+# --- the exclude list, as both restic and find(1) understand it ---------------
+# EXCLUDE_OR holds an OR-list of find predicates, one per pattern in the exclude
+# file, ready to be wrapped as \( "${EXCLUDE_OR[@]}" \) -prune -o ...
+#
+# It exists because two guards measured the FILESYSTEM while claiming to measure
+# the BACKUP SET: the source-size limit ran `du /srv` and the SQLite drift scan ran
+# `find /srv`, neither of which knows what restic will actually omit. So ~19G of
+# deliberately excluded data counted against MAX_SOURCE_GB, and a database living
+# under an excluded path was reported as a coverage hole it could never be. Both
+# now measure the same set restic walks.
+#
+# Pattern translation, matching deploy/exclude.txt's own documented meanings:
+#   /*     a path prefix          -> -path (prunes the whole subtree)
+#   **/x   a basename at any depth -> -name
+#   x      a bare name            -> -name
+# Restic's glob dialect is richer than this (character classes, ** inside a
+# segment). Anything it would match that find would not is a pattern whose purpose
+# is pruning a directory tree, which is the /* form - so a divergence here costs
+# accuracy in the guard, never data in the backup, which is still driven by
+# --exclude-file in do_backup.
+EXCLUDE_OR=()
+load_excludes() {
+  EXCLUDE_OR=()
+  local pat
+  local -a pred=()
+  [[ -f $EXCLUDES ]] || return 0
+  while IFS= read -r pat; do
+    [[ -n $pat ]] || continue
+    # Explicit `if`, not `[[ ]] && continue`: a false AND-list as the last command
+    # in a loop body returns non-zero and exits the shell under set -e with no
+    # message. Same trap as do_dumps.
+    if [[ $pat == \#* ]]; then
+      continue
+    fi
+    case $pat in
+      '**/'*) pred=( -name "${pat#\*\*/}" ) ;;
+      /*)     pred=( -path "$pat" ) ;;
+      *)      pred=( -name "$pat" ) ;;
+    esac
+    if (( ${#EXCLUDE_OR[@]} )); then
+      EXCLUDE_OR+=( -o )
+    fi
+    EXCLUDE_OR+=( "${pred[@]}" )
+  done < "$EXCLUDES"
+}
+
+# Whole gigabytes of the source that restic would actually read, i.e. /srv with the
+# excluded subtrees pruned, and the writable state tree pruned even if the exclude
+# file were to lose that entry - staging is created by this phase and backed up
+# explicitly, so counting it here would double-count it.
+measure_source_gb() {
+  local bytes
+  bytes=$(find /srv -xdev \
+            \( "${EXCLUDE_OR[@]}" -o -path "$STAGE" -o -path "$BASE" \) -prune -o \
+            -type f -printf '%s\n' 2>/dev/null \
+          | awk '{ s += $1 } END { print s + 0 }')
+  [[ $bytes =~ ^[0-9]+$ ]] || return 1
+  printf '%s' $(( bytes / 1073741824 ))
+}
+
 # `synosharesnapshot list` prints a header line BEFORE the snapshots
 # ("There has N snapshots of share [x]"), so wc -l is always count+1 and any
 # tail -n +N is off by one. Always strip line 1.
@@ -325,12 +395,12 @@ select_sweep_candidates() { # now_epoch retention_days
 # preflight — fail before touching anything
 # ---------------------------------------------------------------------------
 do_preflight() {
-  require_cmds restic ssh jq docker sqlite3 curl numfmt du stat
+  require_cmds restic ssh jq docker sqlite3 curl numfmt stat find
 
   if [[ $DRY_RUN == 1 ]]; then
     log "dry-run: would install ${EXCLUDES_SRC} -> ${EXCLUDES}"
     log "dry-run: would assert RESTORE.md, NAS reachability, passwordless sudo,"
-    log "dry-run: repo openable, source <= ${MAX_SOURCE_GB}G, then take the run lock"
+    log "dry-run: repo openable, source <= ${MAX_SOURCE_GB}G (excludes applied), then take the run lock"
     log "dry-run: repository=${RESTIC_REPOSITORY}"
     log "dry-run: staging=${STAGE} state=${STATE}"
     log "dry-run: snapshot retention=${SNAPSHOT_RETENTION_DAYS}d (${SNAPSHOT_RETENTION_WEEKS} weeks)"
@@ -368,6 +438,10 @@ do_preflight() {
   # "36 patterns" log line that is mostly prose is worse than no number at all.
   log "installed exclude list ($(grep -cvE '^[[:space:]]*(#|$)' "$EXCLUDES" || true) patterns) -> ${EXCLUDES}"
 
+  # Loaded from the copy just installed, so the guard below and the drift scan in
+  # do_dumps measure the same set restic will.
+  load_excludes
+
   # A lock from a crashed run must not block forever, but a lock that is hours old
   # is more likely a genuinely stuck run than a corpse.
   if [[ -f $STATE/run.lock ]]; then
@@ -386,11 +460,14 @@ do_preflight() {
   restic_run cat config >/dev/null \
     || die "restic cannot open ${RESTIC_REPOSITORY} (wrong password, wrong path, or key not mounted)"
 
+  # Measured the way do_backup will walk it: excluded subtrees pruned, not
+  # subtracted after the fact. `du -sx /srv` answered a different question and made
+  # a correct source look 19G too large.
   local src_gb
-  src_gb=$(du -sx --block-size=1G /srv 2>/dev/null | cut -f1)
-  [[ $src_gb =~ ^[0-9]+$ ]] || die "cannot measure /srv size (du returned '${src_gb:-}')"
+  src_gb=$(measure_source_gb) \
+    || die "cannot measure the source size (find returned no usable total)"
   (( src_gb <= MAX_SOURCE_GB )) \
-    || die "source is ${src_gb}G, above MAX_SOURCE_GB=${MAX_SOURCE_GB} — wrong mount, or raise the limit deliberately"
+    || die "source is ${src_gb}G with excludes applied, above MAX_SOURCE_GB=${MAX_SOURCE_GB} — wrong mount, or raise the limit deliberately"
 
   # Staging is wiped every run: it must be a clean restore input, never a
   # carry-over. State lives beside it and is never wiped.
@@ -399,7 +476,7 @@ do_preflight() {
 
   printf '%s\n' "${DAG_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}" > "$STATE/run.lock"
   stamp > "$STATE/backup_start.epoch"
-  log "preflight ok (run $(cat "$STATE/run.lock"), source ${src_gb}G, repo ${RESTIC_REPOSITORY})"
+  log "preflight ok (run $(cat "$STATE/run.lock"), source ${src_gb}G after excludes, repo ${RESTIC_REPOSITORY})"
 }
 
 # ---------------------------------------------------------------------------
@@ -454,11 +531,11 @@ do_dumps() {
   if [[ $DRY_RUN == 1 ]]; then
     log "dry-run: would pg_dump ${#PG_CONTAINERS[@]} containers: ${PG_CONTAINERS[*]}"
     log "dry-run: would .backup + VACUUM INTO ${#SQLITE_DBS[@]} SQLite DBs, then integrity_check each copy"
-    log "dry-run: would fail on any >10M *.db under /srv that is not on the list (drift hole)"
+    log "dry-run: would fail on any >10M *.db under /srv that is not on the list and not excluded (drift hole)"
     return 0
   fi
 
-  require_cmds docker sqlite3
+  require_cmds docker sqlite3 find
   [[ -d $STAGE/pg ]] || die "${STAGE} missing — the preflight phase did not run in this cycle"
 
   local c out sz user db
@@ -503,7 +580,20 @@ do_dumps() {
   done
 
   # A new database nobody added to the list is a silent hole in coverage. Fail on
-  # it. NOTE: written as `if`, not `[[ ]] && known=1` - under `set -e` a failing
+  # it - but only when the database is actually IN the backup. Scanning raw /srv
+  # reported files under excluded paths, which restic never copies and which are
+  # therefore not a coverage gap at all: the failure was unfixable except by
+  # exempting the path or by adding a database to SQLITE_DBS that would then be
+  # dumped and backed up twice.
+  #
+  # Without the exclude list this check is worse than useless, because every
+  # excluded database would be reported, so a missing list is its own error rather
+  # than a blind scan.
+  load_excludes
+  (( ${#EXCLUDE_OR[@]} )) \
+    || die "exclude list ${EXCLUDES} is missing or has no patterns — the SQLite drift scan would be exclude-blind, so it cannot tell a coverage hole from an excluded file; did preflight complete?"
+
+  # NOTE: written as `if`, not `[[ ]] && known=1` - under `set -e` a failing
   # AND-list as the last command in a loop body exits the shell silently, which
   # would kill this phase with no message on the first non-matching entry.
   local f known e
@@ -516,10 +606,11 @@ do_dumps() {
       fi
     done
     if (( ! known )); then
-      die "undiscovered SQLite >10M: ${f} — add it to SQLITE_DBS"
+      die "undiscovered SQLite >10M in the backup set: ${f} — add it to SQLITE_DBS (or, if it is a copy that need not be backed up, exclude it in deploy/exclude.txt)"
     fi
-  done < <(find /srv -xdev -type f -name '*.db' -size +10M \
-             -not -path "$STAGE/*" -not -path "$BASE/*" 2>/dev/null || true)
+  done < <(find /srv -xdev \
+             \( "${EXCLUDE_OR[@]}" -o -path "$STAGE" -o -path "$BASE" \) -prune -o \
+             -type f -name '*.db' -size +10M -print 2>/dev/null || true)
 
   log "dumps ok"
 }

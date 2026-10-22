@@ -14,8 +14,9 @@
 # with no environment at all and this must still exit 0.
 #
 # This file is also SOURCED by scripts/test-retention.sh, which drives
-# snapshot_epoch and select_sweep_candidates directly. That is why the entry point
-# at the bottom is guarded: importing the functions must not run main.
+# snapshot_epoch, select_sweep_candidates and snapshot_delete_cmd directly. That is
+# why the entry point at the bottom is guarded: importing the functions must not run
+# main.
 set -Eeuo pipefail
 IFS=$'\n\t'
 
@@ -262,6 +263,55 @@ require_cmds() {
   if (( ${#missing[@]} )); then
     die "missing required commands: ${missing[*]}"
   fi
+}
+
+# Join arguments with single spaces, whatever IFS happens to be.
+#
+# This exists because IFS is $'\n\t' at the top of this file, and `${arr[*]}`
+# expands with the FIRST character of IFS. That made the delete command below
+# newline-separated. Log lines want spaces; remote shell commands need more than
+# just spaces (see snapshot_delete_cmd).
+join_space() { local IFS=' '; printf '%s' "$*"; }
+
+# The remote command for a multi-name snapshot delete, as a PURE function.
+#
+# WHY THIS IS SEPARATE AND WHY IT IS QUOTED BY HAND. The obvious spelling is
+#
+#     local quoted=()
+#     for s in "${doomed[@]}"; do quoted+=("'${s}'"); done
+#     nas_ssh "... delete '${SHARE}' ${quoted[*]}"
+#
+# and it is WRONG in a way nothing caught. `${quoted[*]}` inside a double-quoted
+# string expands with the first character of IFS - which is a NEWLINE here - so
+# the names arrived at the remote shell as a single argument containing newlines.
+# The remote shell then ran `synosharesnapshot delete '<share>' '<first name>'` and
+# tried to execute the remaining names as commands:
+#
+#     sh: line 1: GMT-04-2026.10.22-10.39.45: command not found
+#
+# Observed on a real run on 2026-10-22: TWO names selected, ONE deleted, exit 127
+# swallowed by `|| log WARNING`, phase reported `prune ok`. A partial delete was
+# therefore indistinguishable from a clean one, and it only happens when N > 1 -
+# which is why every run before it looked healthy.
+#
+# Single-quote wrapping (not `printf %q`): %q can emit $'...' for awkward strings,
+# which is bash-only, and the remote login shell is not ours to assume. A name
+# containing a single quote cannot be wrapped safely this way, so it is REFUSED
+# rather than escaped - a snapshot name is DSM-generated and never contains one,
+# and refusing is the safe direction for a destructive command.
+#
+# Returns non-zero if any argument cannot be represented safely.
+snapshot_delete_cmd() { # share name...
+  local share=$1
+  shift
+  local out="sudo -n /usr/syno/sbin/synosharesnapshot delete" n
+  for n in "$share" "$@"; do
+    if [[ $n == *"'"* ]]; then
+      return 1
+    fi
+    out+=" '${n}'"
+  done
+  printf '%s' "$out"
 }
 
 # --- the exclude list, as both restic and find(1) understand it ---------------
@@ -956,12 +1006,52 @@ do_prune() {
   if (( ${#doomed[@]} == 0 )); then
     log "no snapshots older than ${SNAPSHOT_RETENTION_DAYS}d; sweep is a no-op"
   else
-    log "deleting ${#doomed[@]} snapshot(s) older than ${SNAPSHOT_RETENTION_DAYS}d: ${doomed[*]}"
-    # delete takes several snapshot names in one call
-    local quoted=() s
-    for s in "${doomed[@]}"; do quoted+=("'${s}'"); done
-    nas_ssh "sudo -n /usr/syno/sbin/synosharesnapshot delete '${SHARE}' ${quoted[*]}" \
-      || log "WARNING: snapshot delete failed — snapshots will accumulate; the repo is still pruned safely"
+    log "deleting ${#doomed[@]} snapshot(s) older than ${SNAPSHOT_RETENTION_DAYS}d: $(join_space "${doomed[@]}")"
+
+    # THE ARGV IS BUILT BY A PURE FUNCTION, and the failure is FATAL.
+    #
+    # Both halves of this were wrong and only showed up when the sweep finally had
+    # more than one name to delete (2026-10-22, forced with SNAPSHOT_RETENTION_DAYS=0):
+    #
+    #   1. The command was assembled with "${quoted[*]}", which joins on the FIRST
+    #      character of IFS - a newline in this file. Two names therefore became one
+    #      argument containing a newline; the remote shell deleted the first and
+    #      tried to EXECUTE the second ("command not found", exit 127). One of two
+    #      snapshots died. See snapshot_delete_cmd for the quoting rationale.
+    #
+    #   2. The call was `nas_ssh ... || log "WARNING: snapshot delete failed"`, so
+    #      that exit 127 left the phase reporting `prune ok`. A partial delete was
+    #      indistinguishable from a clean one, and the only trace was a WARNING in a
+    #      log nobody reads on success.
+    #
+    # A delete that does not happen must fail the step: the snapshots are the undo
+    # that does not need the repository to be readable, and silently failing to
+    # maintain them is how the retention window quietly collapses. It stops SHORT of
+    # the restic work already done above - there is nothing to roll back - but the
+    # phase exits non-zero so the run is not reported healthy.
+    local cmd
+    if ! cmd=$(snapshot_delete_cmd "$SHARE" "${doomed[@]}"); then
+      die "refusing to build a delete command: a snapshot name contains a single quote, which cannot be safely wrapped for the remote shell"
+    fi
+    log "delete command: ${cmd}"
+
+    if nas_ssh "$cmd"; then
+      log "deleted ${#doomed[@]} snapshot(s)"
+    else
+      die "snapshot delete FAILED for ${#doomed[@]} name(s) — snapshots will accumulate and the retention window will silently shrink; the repository was already pruned, so re-run this phase once the cause is fixed"
+    fi
+
+    # Deleted names are only claimed if the count actually moved. A delete that
+    # exits 0 without removing anything is a different failure from one that exits
+    # non-zero, and it is the more dangerous of the two because it looks like
+    # success.
+    local after_count
+    after_count=$(snapshot_count)
+    local expected=$(( total - ${#doomed[@]} ))
+    if (( after_count != expected )); then
+      die "snapshot count is ${after_count} after deleting ${#doomed[@]} of ${total} (expected ${expected}) — the delete did not remove what it selected"
+    fi
+    log "snapshot count ${total} -> ${after_count}"
   fi
 
   log "prune ok"
@@ -1069,7 +1159,7 @@ main() {
     log "validate-only: staging=${STAGE} state=${STATE}"
     log "validate-only: excludes=${EXCLUDES} (from ${EXCLUDES_SRC})"
     log "validate-only: retention=${SNAPSHOT_RETENTION_DAYS}d (${SNAPSHOT_RETENTION_WEEKS} weeks)"
-    log "validate-only: keep policy=${RESTIC_KEEP_ARGS[*]}"
+    log "validate-only: keep policy=$(join_space "${RESTIC_KEEP_ARGS[@]}")"
     return 0
   fi
 
@@ -1092,7 +1182,8 @@ main() {
 }
 
 # Guarded so scripts/test-retention.sh can source this file for the real
-# snapshot_epoch/select_sweep_candidates: importing must not run a phase.
+# snapshot_epoch/select_sweep_candidates/snapshot_delete_cmd: importing must not
+# run a phase.
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   main "$@"
 fi

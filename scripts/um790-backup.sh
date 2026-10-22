@@ -1001,8 +1001,49 @@ EOF
   mv -f "$tmp" "$STATE/last_success.json"
   rm -f "$STATE/run.lock"
 
-  notify default "um790 backup OK" "run ${run_id} — ${snapshots} snapshots, $(numfmt --to=iec "$bytes"), ${duration}s"
-  log "status written (${snapshots} snapshots, ${bytes}B, ${duration}s)"
+  # THE NOTIFICATION BODY IS FOR A LOCK SCREEN, NOT A LOG.
+  #
+  # It used to read: run 034kNVOwLxtqLRbN8aCu67 — 1 snapshots, 12G, 889s
+  #
+  # Both halves of that were wrong for the medium, in ways that are only obvious
+  # when you are the one glancing at a phone at 07:00:
+  #
+  #   1. THE RUN ID. `run_id` is Dagu's internal ULID (26 chars, base32). On a
+  #      notification it sits between the reader and the three numbers they
+  #      actually wanted, and it answers a question nobody asks at that moment:
+  #      which run was this. It is NOT lost by dropping it - it is in
+  #      last_success.json (written two lines above), in the restic snapshot's
+  #      `run:<id>` tag set by do_backup, and in the Dagu UI, which is the
+  #      authoritative place to look up a specific run. The body's job is "did
+  #      last night's backup work", answered at a glance.
+  #
+  #      do_fail KEEPS the run ID on purpose. A failure is precisely when you need
+  #      the pointer to the run in order to investigate, and a FAILED message is
+  #      read rather than glanced at.
+  #
+  #   2. "1 snapshots". The count is printed in two places - this body and the log
+  #      line below - so it is pluralised once, here, rather than by rewording
+  #      either site.
+  #
+  # Deliberately NOT changed: `numfmt --to=iec` renders 12263703410 as "12G". That
+  # is coarse (the true value is 11.42), but it is a proven call on an uncovered
+  # path, and a format change here would be a behaviour change to the only line
+  # that tells a human the backup is healthy. NOTHING in CI asserts this text:
+  # grep for notify/num_fmt/NTFY across scripts/test-retention.sh and
+  # .buildkite/pipeline.yml returns no matches, and the smoke gate's --dry-run
+  # returns from this function before any of it is built.
+  #
+  # Order matters and is unchanged: last_success.json is renamed into place and the
+  # lock released BEFORE the notification is attempted, so a notifier outage can
+  # only cost the message - it can never withhold the heartbeat or block the next
+  # run on a stale lock.
+  local noun=snapshots
+  if (( snapshots == 1 )); then
+    noun=snapshot
+  fi
+
+  notify default "um790 backup OK" "${snapshots} ${noun}, $(numfmt --to=iec "$bytes"), ${duration}s"
+  log "status written (${snapshots} ${noun}, ${bytes}B, ${duration}s)"
 }
 
 # ---------------------------------------------------------------------------

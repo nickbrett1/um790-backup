@@ -29,6 +29,14 @@
 #   UM790_BACKUP_BRANCH        default auto/um790-backup-pin
 #   UM790_BACKUP_IMAGE_NAME    default ghcr.io/nickbrett1/um790-backup
 #   DRY_RUN=1                  clone and rewrite, print the diff, do not push
+#
+# HISTORY: the first version could not perform the first bump. The DAG ships the
+# pin as `UM790_BACKUP_IMAGE: ""` on purpose (the wrapper is
+# ${UM790_BACKUP_IMAGE:?}, so an unvalidated default cannot run), but the reading
+# guard was `[[ -n $current ]]` - which treats "line present, value empty" as
+# "line missing". It died on the only state the file has ever been in, and would
+# have worked only once a SHA was already set by hand. Presence and emptiness are
+# separate questions; they are now asked separately.
 set -Eeuo pipefail
 IFS=$'\n\t'
 
@@ -85,13 +93,19 @@ git config user.email "ci@nickbrett1.invalid"
 # ---------------------------------------------------------------------------
 [[ -f $DAG_PATH ]] || die "${DAG_PATH} does not exist in ${REPO} - wrong path, or the DAG was renamed"
 
+# Presence first, as its own question. The shipped value is intentionally empty,
+# so an empty `current` below is a normal starting point and must not be read as
+# a missing line. Exactly one match, because a second pin line would mean this
+# regex is rewriting something it does not understand.
+pin_lines=$(grep -cE '^[[:space:]]*UM790_BACKUP_IMAGE:[[:space:]]*"' "$DAG_PATH" || true)
+[[ $pin_lines == 1 ]] \
+  || die "expected exactly one UM790_BACKUP_IMAGE: \"...\" line in ${DAG_PATH}, found ${pin_lines} - refusing to guess at the shape"
+
 current=$(sed -n -E 's/^[[:space:]]*UM790_BACKUP_IMAGE:[[:space:]]*"(.*)"[[:space:]]*$/\1/p' "$DAG_PATH")
-[[ -n $current ]] \
-  || die "no UM790_BACKUP_IMAGE: \"...\" line in ${DAG_PATH} - refusing to guess at the shape"
-log "currently pinned: ${current}"
+log "currently pinned: ${current:-<empty>}"
 
 if [[ $current == "$TAG" ]]; then
-  log "already pinned to ${TAG:0:0}${TAG} - nothing to do"
+  log "already pinned to ${TAG} - nothing to do"
   exit 0
 fi
 

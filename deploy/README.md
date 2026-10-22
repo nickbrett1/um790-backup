@@ -89,13 +89,33 @@ Always run with `--rm` and pin the commit SHA: an immutable image is the only
 thing that makes a scheduled run reproducible.
 
 ```bash
-docker run --rm \
-  -v /srv:/srv:ro \
-  -v /srv/.um790-backup:/srv/.um790-backup \
-  -e RESTIC_PASSWORD \
-  -e NTFY_URL \
-  ghcr.io/nickbrett1/um790-backup:<commit-sha>
+doppler run --project um790-backup --config prd -- \
+  docker run --rm \
+    -v /srv:/srv:ro \
+    -v /srv/.um790-backup:/srv/.um790-backup \
+    -v /var/run/docker.sock:/var/run/docker.sock:ro \
+    -v /srv/.um790-backup/ssh:/run/ssh:ro \
+    -e RESTIC_PASSWORD \
+    -e NTFY_URL \
+    -e DAG_RUN_ID \
+    -e MAX_SOURCE_GB \
+    ghcr.io/nickbrett1/um790-backup:<commit-sha> <phase>
 ```
+
+All four mounts are load-bearing, and each one is the difference between a phase
+that works and a phase that fails or, worse, silently does less:
+
+| Mount | Needed by | Without it |
+|---|---|---|
+| `/srv:ro` | every phase | `/srv is not mounted` at preflight |
+| `/srv/.um790-backup` | every phase | state, staging and the installed exclude list are lost between phases |
+| `/var/run/docker.sock:ro` | `config`, `dumps` | `docker daemon unreachable` at `config` — the run dies after preflight has taken the lock |
+| `/srv/.um790-backup/ssh:ro` | all NAS work | restic and ssh cannot authenticate; every NAS phase fails |
+
+`-e VAR` with no value forwards the variable from the invoking environment
+rather than `-e VAR=value`, which keeps the password out of the process list.
+Under `doppler run` the values come from Doppler, so they are never written to a
+file on disk.
 
 The mount set is a contract between this image and whoever invokes it. The
 entrypoint must assert every path it expects exists and is readable, and exit
@@ -103,10 +123,24 @@ non-zero naming the missing path — a DAG/image mismatch then fails run #1 with
 `/backup: not found` instead of silently producing an empty backup. Keep the
 `-v` list in sync with the scheduler's definition.
 
+### `MAX_SOURCE_GB`
+
+The source-size guard, in whole gigabytes, measured on `/srv` **with the exclude
+list applied**. It describes the backup set, not the disk: the raw `/srv` total
+is roughly 19G larger than the payload (`/srv/backups`, `/srv/marketdata`, the
+Postgres clusters, caches, Dagu's own state), and counting that is why a correct
+source could fail this check.
+
+It exists to catch a **wrong mount**, not normal growth — a `/srv` that suddenly
+measures hundreds of gigabytes is a disk mounted in the wrong place. The default
+(70 against ~45G of payload) is deliberately loose for that reason. Raise it when
+the data genuinely grows; do not raise it to make a mount problem go away.
+
 ## 4. Promotion, pinning and rollback
 
 Every image is tagged with its commit SHA as well as `latest`. **Only the SHA is
-ever used to run it.**
+never used to run it.** *(sic — the SHA is the only tag used; `latest` is a
+convenience for local experiments and must not appear in a scheduler.)*
 
 Nobody edits the pin by hand any more. On a green `main` build, the
 `dagu_pin_bump` step runs `scripts/bump-dagu-pin.sh`, which:
@@ -152,7 +186,7 @@ The image is published to
 Dockerfile carries
 `org.opencontainers.image.source=https://github.com/nickbrett1/um790-backup`,
 so GHCR links the package to this repo on first push: a **public repo yields a
-public package** and the pulling host needs no credentials. A **private** repo
+public package** and the pulling host needs no credentials. A **private repo**
 yields a private package — log the pulling host's Docker daemon in once with a
 classic PAT that has the `read:packages` scope:
 
@@ -166,6 +200,11 @@ echo "$GHCR_READ_TOKEN" | docker login ghcr.io -u <github-user> --password-stdin
 above and the `volumes:` block in `docker-compose.yml`. Mounts are read-only
 unless the entry sets `"readOnly": false`.
 
+The generated config produces only the first two (§3 table); the docker socket
+and the ssh directory are hand-added, because they are this project's specific
+requirements rather than generic batch-job mounts. Treat all four as the contract
+and copy them from `docker-compose.yml` rather than from memory.
+
 ## 7. Environment variables
 
 Keys are derived from the `envVars` configuration; nothing is invented here.
@@ -174,6 +213,10 @@ Keys are derived from the `envVars` configuration; nothing is invented here.
 RESTIC_PASSWORD=
 NTFY_URL=
 ```
+
+Plus the NAS block (`RESTIC_REPOSITORY`, `NAS_HOST`, `NAS_PORT`, `NAS_USER`),
+the per-run `DAG_RUN_ID`, and `MAX_SOURCE_GB` — all documented with real
+defaults in `.env.example`.
 
 Retention knobs are read by the runner and default to the documented contract;
 set them only to deviate from it. `SNAPSHOT_RETENTION_WEEKS` (default 8) is the

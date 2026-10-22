@@ -50,6 +50,12 @@ NAS_SSH_KEY="$SSH_DIR/id_ed25519_ryzen"
 RESTIC_SSH_KEY="$SSH_DIR/id_ed25519_restic"
 KNOWN_HOSTS="$SSH_DIR/known_hosts"
 
+# The repository path stripped of scheme and host, e.g. "restic-target/um790".
+# Derived rather than hardcoded so a SHARE override cannot point the NAS-side
+# checks at a directory that is not the one restic will use.
+REPO_REL="${REPOSITORY##*:}"   # /restic-target/um790
+REPO_REL="${REPO_REL#/}"       # restic-target/um790
+
 STEPS=(dirs restore-md keys known-hosts nas-keys repo verify)
 MODE=RUN      # RUN | CHECK
 CHECK=0
@@ -339,7 +345,7 @@ step_known_hosts() {
 
   if [[ -n $pinned ]]; then
     if [[ $pinned == "$live" ]]; then
-      ok "host key for [${NAS_HOST}]:${NAS_PORT} pinned and still current (${live%% *})"
+      ok "host key for [${NAS_HOST}]:${NAS_PORT} pinned and still current"
       return 0
     fi
     # A changed host key is either a rebuilt NAS or an interception. Both need a
@@ -352,8 +358,8 @@ step_known_hosts() {
   ssh-keyscan -p "$NAS_PORT" -T 5 "$NAS_HOST" 2>/dev/null > "$tmp"
   install -m 0600 "$tmp" "$KNOWN_HOSTS"
   rm -f "$tmp"
-  ok "pinned [${NAS_HOST}]:${NAS_PORT} -> ${KNOWN_HOSTS} (${live%% *})"
-  warn "that pin is trust-on-first-use: it records whatever answered first. Verify the fingerprint against DSM, or accept that StrictHostKeyChecking=yes only proves it has not changed SINCE TODAY."
+  ok "pinned [${NAS_HOST}]:${NAS_PORT} -> ${KNOWN_HOSTS}"
+  warn "that pin is trust-on-first-use: it records whatever answered first (${live}). Verify the fingerprint against DSM, or accept that StrictHostKeyChecking=yes only proves it has not changed SINCE TODAY."
 }
 
 step_nas_keys() {
@@ -382,25 +388,40 @@ step_nas_keys() {
   # it here, next to the other NAS-side key step. Append-only, idempotent, and
   # matched on the base64 body so a `restrict,command=...` prefix on an existing
   # entry does not defeat the check.
-  local restic_pub restic_body authz
+  local restic_pub restic_body authz restic_line
   restic_pub=$(cat "${RESTIC_SSH_KEY}.pub")
   restic_body=$(awk '{print $2}' "${RESTIC_SSH_KEY}.pub")
   authz="/var/services/homes/${RESTIC_USER}/.ssh/authorized_keys"
 
-  if nas_ssh "sudo -n grep -qF '${restic_body}' '${authz}'" >/dev/null 2>&1; then
-    ok "restic public key already authorised for ${RESTIC_USER}@${NAS_HOST}"
-  else
+  # Match on the base64 body, not the whole line: an entry may carry a
+  # restrict,command= prefix, and a whole-line grep would not find it.
+  restic_line=$(nas_ssh "sudo -n grep -F -m1 '${restic_body}' '${authz}'" 2>/dev/null || true)
+
+  if [[ -z $restic_line ]]; then
     if (( CHECK )); then die "restic public key is not authorised for ${RESTIC_USER}@${NAS_HOST} (the repo step would try to init over an existing repository)"; fi
     log "installing the restic public key for ${RESTIC_USER}@${NAS_HOST}"
-    # Same restriction as the key already in place: this account exists to carry
-    # the sftp transport, and a bare key would hand it a login shell.
+    # Same restriction as an sftp-only account should always carry: this key
+    # exists to carry the transport, and a bare key would hand it a login shell.
     # tee runs as root, so ownership and mode are restored afterwards.
     printf 'restrict,command="internal-sftp" %s\n' "$restic_pub" \
       | nas_ssh "sudo -n tee -a '${authz}' >/dev/null" \
-      || die "could not install ${RESTIC_SSH_KEY}.pub for ${RESTIC_USER}. Manual fallback: append it to ${authz} on the NAS (directory 0700, file 0600, owner ${RESTIC_USER})."
+      || die "could not install ${RESTIC_SSH_KEY}.pub for ${RESTIC_USER}. Manual fallback: append restrict,command=\"internal-sftp\" ${restic_pub} to ${authz} on the NAS (directory 0700, file 0600, owner ${RESTIC_USER})."
     nas_ssh "sudo -n chown ${RESTIC_USER}:users '${authz}' && sudo -n chmod 0600 '${authz}'" >/dev/null 2>&1 \
       || warn "installed the restic key but could not restore ownership/mode on ${authz} - check it is ${RESTIC_USER}:users 0600"
     ok "restic public key installed for ${RESTIC_USER}@${NAS_HOST}"
+    return 0
+  fi
+
+  # Present - but authorised HOW? A line with no command= lets this account run a
+  # shell; the account exists to carry sftp only, and the repository opens either
+  # way, which is exactly why an over-broad key is easy to leave in place. Warn
+  # rather than rewrite: bootstrap did not create that entry, and editing
+  # authorized_keys to tighten a key that is in use is the operator's decision,
+  # not a side effect of setup.
+  if [[ $restic_line == *'command="internal-sftp"'* ]]; then
+    ok "restic public key authorised for ${RESTIC_USER}@${NAS_HOST} (restricted to internal-sftp)"
+  else
+    warn "the restic key in ${authz} is authorised WITHOUT command=\"internal-sftp\", so it grants ${RESTIC_USER}@${NAS_HOST} a shell rather than sftp only. Backups work either way, which is why this goes unnoticed. To tighten it, replace that line with: restrict,command=\"internal-sftp\" ${restic_pub}"
   fi
 }
 
@@ -432,7 +453,7 @@ step_repo() {
   # password turns into a destructive command. A repo directory that already
   # holds `config` is NOT uninitialised, so an init would be wrong whatever the
   # reason for the failure - say which problem it is instead of guessing.
-  if nas_ssh_works && nas_ssh "sudo -n test -f /volume1/${SHARE}/um790/config" >/dev/null 2>&1; then
+  if nas_ssh_works && nas_ssh "sudo -n test -f /volume1/${REPO_REL}/config" >/dev/null 2>&1; then
     die "${REPOSITORY} already holds a repository (config is present) but cannot be opened. That is an access problem - wrong RESTIC_PASSWORD, or ${RESTIC_SSH_KEY}.pub not authorised for ${RESTIC_USER} - and restic init would be the wrong response."
   fi
 

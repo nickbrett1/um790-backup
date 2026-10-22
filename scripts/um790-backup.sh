@@ -314,13 +314,29 @@ load_excludes() {
 # excluded subtrees pruned, and the writable state tree pruned even if the exclude
 # file were to lose that entry - staging is created by this phase and backed up
 # explicitly, so counting it here would double-count it.
+#
+# THE FORMAT SPECIFIER IS LOAD-BEARING. The obvious `awk '{s+=$1} END {print s+0}'`
+# is not integer-preserving on the awk that actually ships: the image carries mawk
+# 1.3.4, whose OFMT is "%.6g", so a total of 31,806,800,000 bytes prints as
+# 3.18068e+10 and the ^[0-9]+$ guard below rejects it. That fires for ANY /srv
+# total >= 1,000,000 bytes, i.e. always, and it took preflight down on the first
+# real run after passing CI - because CI's smoke gate only exercises `--dry-run`,
+# which returns before this is ever called. printf "%.0f" is explicit and portable
+# across mawk/gawk/busybox.
+#
+# The raw value is echoed in the failure message for the same reason: the previous
+# message ("find returned no usable total") described the symptom and named
+# nothing, so the cause had to be found by tracing the script with xtrace.
 measure_source_gb() {
   local bytes
   bytes=$(find /srv -xdev \
             \( "${EXCLUDE_OR[@]}" -o -path "$STAGE" -o -path "$BASE" \) -prune -o \
             -type f -printf '%s\n' 2>/dev/null \
-          | awk '{ s += $1 } END { print s + 0 }')
-  [[ $bytes =~ ^[0-9]+$ ]] || return 1
+          | awk '{ s += $1 } END { printf "%.0f\n", s + 0 }')
+  if [[ ! $bytes =~ ^[0-9]+$ ]]; then
+    log "ERROR: byte total from find/awk was '${bytes}', which is not a plain integer"
+    return 1
+  fi
   printf '%s' $(( bytes / 1073741824 ))
 }
 
@@ -490,7 +506,7 @@ do_preflight() {
   # a correct source look 19G too large.
   local src_gb
   src_gb=$(measure_source_gb) \
-    || die "cannot measure the source size (find returned no usable total)"
+    || die "cannot measure the source size (see the ERROR line above for the raw find/awk total)"
   (( src_gb <= MAX_SOURCE_GB )) \
     || die "source is ${src_gb}G with excludes applied, above MAX_SOURCE_GB=${MAX_SOURCE_GB} — wrong mount, or raise the limit deliberately"
 

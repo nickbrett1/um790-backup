@@ -43,3 +43,8 @@ services:
       # compares values from different runs.
       DAG_RUN_ID: ${DAG_RUN_ID:-}
       EXCLUDES: /srv/.um790-backup/exclude.txt
+      # The source-size guard, applied to /srv WITH the exclude list, i.e. to what
+      # is actually copied rather than to the raw filesystem total. Passed through
+      # rather than left to the image default so that a host-side override exists
+      # at all: without an entry here the only way to change it was to rebuild.
+      MAX_SOURCE_GB: ${MAX_SOURCE_GB:-70}

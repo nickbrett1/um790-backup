@@ -146,7 +146,7 @@ SQLITE_DBS=(
 # mode; excluding them would discard the only copy of the pre-migration state.
 #
 # Each entry is a full path whose DIRECTORY is compared literally and whose basename
-# may contain a glob. Only the basename is globbed on purpose - see the match below.
+# may contain a glob. Only the basename globs, on purpose - see the match below.
 #
 # Verified on 2026-10-22 against real state: two files, 240,058,368B each, identical
 # size but different sha256, mtime ~58.7 days older than mailroom.db, nothing
@@ -636,13 +636,23 @@ do_dumps() {
       # still backed up, verbatim, by the restic run in do_backup.
       static_hit=0
       for e in "${STATIC_SQLITE[@]}"; do
-        # The DIRECTORY is compared literally and only the basename is globbed.
-        # `[[ $f == $e ]]` with the whole path would let the pattern's `*` cross a
-        # `/` - bash globbing inside [[ ]] has no FNM_PATHNAME - so
-        # .../backups/mailroom_pre_*/anything/live.db would match and be exempted
-        # from the drift scan while restic copied a live database. Splitting at the
-        # last slash keeps the pattern anchored to one directory.
-        if [[ ${f%/*} == "${e%/*}" && ${f##*/} == "${e##*/}" ]]; then
+        # The DIRECTORY is compared literally and only the BASENAME is a pattern,
+        # which keeps the exemption anchored to one directory. `[[ $f == $e ]]` on
+        # the whole path would let the pattern's `*` cross a `/` - bash's [[ ]]
+        # globbing has no FNM_PATHNAME - so .../backups/mailroom_pre_*.db would
+        # also match .../backups/mailroom_pre_x/live.db, exempting a live database
+        # in a suffixed subdirectory from the drift scan while restic copied it
+        # mid-write. (Verified: the old form does match that path.)
+        #
+        # The basename side MUST stay unquoted. Quoting a pattern in [[ ]] makes it
+        # a literal string compare, so `mailroom_pre_*.db` would match only a name
+        # containing a real asterisk - which shipped once and left static_hit 0 for
+        # the genuine files, turning into a hard die on every run. Neither bash -n
+        # nor the retention suite would catch that; the harness in the commit
+        # message is what asserts this line. SC2053 is disabled for the same
+        # reason: the glob is the point of the expression.
+        # shellcheck disable=SC2053
+        if [[ ${f%/*} == "${e%/*}" && ${f##*/} == ${e##*/} ]]; then
           static_hit=1
         fi
       done

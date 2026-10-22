@@ -17,9 +17,16 @@
 # invocations, so an image that moves between them makes a failure
 # unreproducible and a retry not identical.
 #
-# The file it edits is `um790-backup.yaml.disabled`: even a merged bump cannot
-# put an unattended `restic forget --prune` on a timer. Enabling stays a separate
-# rename, by a human, after the phases have been run by hand once.
+# WHAT THIS SCRIPT DOES NOT DO: schedule anything. The DAG it edits has no cron
+# key and no `name:` key, and this script adds neither. A merged bump changes the
+# image tag and nothing else, so it cannot put an unattended `restic forget
+# --prune` on a timer. Enabling stays a deliberate edit by a human.
+#
+# A merged bump IS live within about a minute, without anyone pulling on the host:
+# dagu-dags-autocommit runs every minute and does fetch + rebase + push, which
+# means it pulls too. That is why the backwards-pin guard below matters more than
+# it looks - there is no window in which a human notices a bad pin before it is on
+# the box.
 #
 # Inputs (all optional):
 #   DOPPLER_TOKEN              required unless DAGU_DAGS_TOKEN is already set;
@@ -29,7 +36,7 @@
 #   UM790_BACKUP_REPO_SLUG     default nickbrett1/dagu-dags
 #   UM790_BACKUP_SRC_REPO_SLUG default nickbrett1/um790-backup (the repo whose
 #                              history the backwards-pin guard asks about)
-#   UM790_BACKUP_DAG_PATH      default dags/ryzen/um790-backup.yaml.disabled
+#   UM790_BACKUP_DAG_PATH      default dags/ryzen/um790-backup.yaml
 #   UM790_BACKUP_BRANCH        default auto/um790-backup-pin
 #   UM790_BACKUP_IMAGE_NAME    default ghcr.io/nickbrett1/um790-backup
 #   DRY_RUN=1                  clone and rewrite, print the diff, do not push
@@ -52,13 +59,27 @@
 #     on every run. Build 41 is the proof: it merged while claiming the guard was
 #     skipped. It now asks the GitHub compare API instead of local git, which has
 #     no cwd to get wrong and no dependency on how deep the checkout was cloned.
+#  4. DAG_PATH was the `.disabled` filename, and that filename was deliberately
+#     retired when the DAG became a managed definition (dagu-dags 5084ec82 and
+#     before it 5c03178). Nothing in this repo referenced it, so build 54 - the
+#     first build after the rename, and the one carrying the mailroom sqlite fix -
+#     published its image successfully and then failed here with
+#     "um790-backup.yaml.disabled does not exist". The image was published and
+#     unpinned, i.e. the fix was built and could not reach the host.
+#
+#     The rename was not wrong; carrying the coupling was. This default is now the
+#     real path, and the lookup below no longer rests on one spelling: it will
+#     accept either form if BOTH ever exist, and if the path is missing it says
+#     what it found instead of only what it wanted. A hardcoded filename in a repo
+#     that cannot see the other repo is a coupling nobody validates, and the cost
+#     is a green-image, red-pipeline stall that looks like a backup problem.
 set -Eeuo pipefail
 IFS=$'\n\t'
 
 API=https://api.github.com
 REPO=${UM790_BACKUP_REPO_SLUG:-nickbrett1/dagu-dags}
 SRC_REPO=${UM790_BACKUP_SRC_REPO_SLUG:-nickbrett1/um790-backup}
-DAG_PATH=${UM790_BACKUP_DAG_PATH:-dags/ryzen/um790-backup.yaml.disabled}
+DAG_PATH=${UM790_BACKUP_DAG_PATH:-dags/ryzen/um790-backup.yaml}
 BRANCH=${UM790_BACKUP_BRANCH:-auto/um790-backup-pin}
 IMAGE=${UM790_BACKUP_IMAGE_NAME:-ghcr.io/nickbrett1/um790-backup}
 SHA=${UM790_BACKUP_IMAGE_SHA:-${BUILDKITE_COMMIT:-}}
@@ -116,10 +137,32 @@ git config user.name "um790-backup CI"
 git config user.email "ci@nickbrett1.invalid"
 
 # ---------------------------------------------------------------------------
+# resolve the DAG
+#
+# The configured path is tried first. If it is absent, the one other spelling
+# this file has ever had is tried, and then the directory is LISTED in the
+# failure message. "does not exist - wrong path, or the DAG was renamed" made the
+# reader go and look; printing the siblings answers the question immediately, and
+# a rename is exactly the event that reaches this branch.
+# ---------------------------------------------------------------------------
+if [[ ! -f $DAG_PATH ]]; then
+  ALT="${DAG_PATH}.disabled"
+  if [[ -f $ALT ]]; then
+    log "WARNING: ${DAG_PATH} not found but ${ALT} is - using the legacy spelling; update UM790_BACKUP_DAG_PATH"
+    DAG_PATH=$ALT
+  else
+    # A DAG that cannot be found after a rename is a deployment stall, not a
+    # code error: the image is published and nothing points at it. Say so, and
+    # show what IS there so the fix is a one-line edit rather than a hunt.
+    found=$(find dags -maxdepth 3 -type f \( -name '*.yaml' -o -name '*.yml' -o -name '*.disabled' \) 2>/dev/null | sort | sed 's/^/  /' || true)
+    die "${DAG_PATH} does not exist in ${REPO}, and neither does ${ALT}. The image ${SHORT} is published but unpinned. DAG files present:
+${found:-  (none found under dags/)}"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # rewrite the pin
 # ---------------------------------------------------------------------------
-[[ -f $DAG_PATH ]] || die "${DAG_PATH} does not exist in ${REPO} - wrong path, or the DAG was renamed"
-
 # Presence first, as its own question. The shipped value is intentionally empty,
 # so an empty `current` below is a normal starting point and must not be read as
 # a missing line. Exactly one match, because a second pin line would mean this
@@ -185,6 +228,15 @@ changed=$(git diff --numstat -- "$DAG_PATH" | awk '{print $1 + $2}')
 grep -qF "UM790_BACKUP_IMAGE: \"${TAG}\"" "$DAG_PATH" \
   || die "the new pin is not present in ${DAG_PATH} after editing"
 
+# Belt and braces for the property this whole pipeline exists to protect: a
+# published image must never be the thing that puts a cron on the host. If a
+# future edit to the DAG arrives with a schedule key already in it, this script
+# is not the place to quietly re-pin and merge. Reads the same shape the DAG's
+# own governance record documents, so `# schedule:` counts as suspicious too.
+if grep -qE '^[[:space:]]*#?[[:space:]]*schedule:' "$DAG_PATH"; then
+  log "NOTE: ${DAG_PATH} carries a schedule key - re-pinning only; this script does not enable or alter scheduling"
+fi
+
 if [[ $DRY_RUN == 1 ]]; then
   git diff -- "$DAG_PATH" >&2
   log "dry-run: would push ${BRANCH}, open/refresh the PR, and merge it; stopping here"
@@ -200,7 +252,7 @@ git add -- "$DAG_PATH"
 git commit --quiet \
   -m "chore(um790-backup): pin image to ${SHORT}" \
   -m "Published by ${BUILDKITE_BUILD_URL:-the um790-backup pipeline}." \
-  -m "The DAG file stays .disabled: this sets the pin, it does not start the schedule. Run the phases by hand once, then rename it." \
+  -m "This sets the image tag and nothing else. ${DAG_PATH} has no schedule key, so this does not start a timer." \
   || die "git commit failed"
 git push --quiet --force origin "HEAD:refs/heads/${BRANCH}" \
   || die "git push failed - does DAGU_DAGS_TOKEN have Contents: write on ${REPO}?"
@@ -227,20 +279,24 @@ Automated pin bump from a green build of \`${SRC_REPO}\`, merged by CI.
 - image: \`${TAG}\`
 - build: ${BUILDKITE_BUILD_URL:-not a Buildkite run}
 
-This changes one line in \`${DAG_PATH}\` and nothing else. The file stays
-\`.disabled\`, so this **sets the pin but does not start the schedule**.
+This changes one line in \`${DAG_PATH}\` and nothing else. The DAG has no
+schedule key, so this **sets the pin but does not start a timer**.
 
 This PR is a record, not a decision: it merges itself. The commit it produces is
 the NAS deployment history, and reverting it is the rollback.
 
-Before renaming it to \`um790-backup.yaml\`, run the phases by hand once each:
+Naming the image, though, is not the same as proving it. Before any schedule is
+added, run the phases by hand once each, as one run:
 
 \`\`\`
 um790-backup.sh preflight config dumps backup check snapshot prune status
 \`\`\`
 
 \`snapshot\` and \`prune\` are the two that have never run against DSM. Check that
-prune's sweep line selected the snapshot you expected before enabling the cron.
+prune's sweep line selected the snapshot you expected before enabling anything.
+Prefer a whole-run invocation to \`dagu retry --step\`: a single step runs in a
+fresh run and does not honour \`depends:\`, so it can pass over a dependency that
+never ran.
 
 Rollback: revert this PR's commit, or set \`UM790_BACKUP_IMAGE\` back to the
 previous SHA. Nothing was pushed to a channel, so there is nothing to unpublish.

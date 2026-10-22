@@ -135,9 +135,21 @@ removes its own footprint.
 
 ## What bootstrap does not do
 
-- **Enable the schedule.** See `../dags/ryzen/um790-backup.yaml.disabled` in
-  `nickbrett1/dagu-dags`. The phases have to be run by hand once, in order,
-  before that file is renamed and cron is pointed at it.
+- **Enable the schedule.** The DAG lives at `dags/ryzen/um790-backup.yaml` in
+  `nickbrett1/dagu-dags`, and it has **no schedule key** — that is how it stays
+  unscheduled, and it is checked mechanically rather than by reading:
+
+  ```bash
+  ! grep -nE '^[[:space:]]*#?[[:space:]]*schedule:' dags/ryzen/um790-backup.yaml
+  ```
+
+  No match, for a real key or a commented-out one. The phases have to be run by
+  hand once, in order, before that key is added. Do not add a `.disabled` suffix
+  instead: Dagu does not discover it (so `dagu ls` cannot tell you what exists)
+  yet it is still runnable by absolute path, and that combination is how this
+  pipeline was hand-run five times on 2026-10-22. `dagu suspend um790-backup`
+  is the way to disable it.
+
 - **Define secrets in Doppler.** `RESTIC_PASSWORD` must exist in
   `um790-backup/prd`; `NTFY_URL` is optional (notifications are best-effort by
   design — a broken notifier never changes a phase result).
@@ -159,3 +171,11 @@ docker run --rm --entrypoint um790-backup.sh \
 `--dry-run` needs no secrets and touches nothing, so it is safe to run any time;
 it is also the CI smoke gate, which is why it must keep passing with the
 environment empty.
+
+It is also why a green CI build proves less than it appears to. `--dry-run`
+returns before any phase body runs, so it cannot catch a defect inside a phase —
+and three did reach `main` that way (a quoted glob that made the `STATIC_SQLITE`
+exemption match nothing, an awk total printed in exponential notation, and the
+mailroom WAL/`CANTOPEN` dump failure). For the first real run, prefer a whole-DAG
+run over `dagu retry --step`: a step retry runs in a fresh run and does not honour
+`depends:`, so it can pass while a dependency never ran.

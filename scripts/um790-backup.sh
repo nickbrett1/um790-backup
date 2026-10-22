@@ -572,6 +572,7 @@ do_dumps() {
   if [[ $DRY_RUN == 1 ]]; then
     log "dry-run: would pg_dump ${#PG_CONTAINERS[@]} containers: ${PG_CONTAINERS[*]}"
     log "dry-run: would .backup + VACUUM INTO ${#SQLITE_DBS[@]} SQLite DBs, then integrity_check each copy"
+    log "dry-run: on .backup failure would copy main+-wal into staging and dump the copy (read-only CANTOPEN case)"
     log "dry-run: would fail on any >10M *.db under /srv that is not on the list, not STATIC_SQLITE, and not excluded (drift hole)"
     return 0
   fi
@@ -610,13 +611,88 @@ do_dumps() {
     tmp=$STAGE/.tmp/${name}.db
     out=$STAGE/sqlite/${name}.db
 
+    # PRIMARY PATH: .backup against the live database, through the read-only mount.
+    #
     # .backup is the online-backup API: it takes the copy under the right locking.
     # VACUUM INTO then compacts the COPY, never the live database.
-    sqlite3 "$dbpath" ".backup '${tmp}'" || die "${name}: .backup failed (database locked?)"
+    #
+    # It is also the only path that captures a live writer's uncheckpointed
+    # commits. With a -wal file present, SQLite builds the WAL index in heap and
+    # .backup over a read-only mount returns the WAL content too - verified by
+    # provoking a writer, not by reading documentation. Do NOT replace this with a
+    # plain copy: that would be a regression, not a simplification.
+    #
+    # IT FAILS IN EXACTLY ONE REAL CASE, AND THE FAILURE IS NOT A LOCK.
+    # If a database is WAL-mode AND has no -wal file at dump time, SQLite must
+    # enter WAL mode properly, which means CREATE the -shm file. /srv is mounted
+    # :ro, so that open gets EROFS and SQLite reports
+    #     Error: unable to open database file     (SQLITE_CANTOPEN, 14)
+    # instantly - nothing is locked and no writer is involved.
+    #
+    # The previous message here guessed "(database locked?)", which is what sent the
+    # first investigation hunting for a concurrent writer. CANTOPEN is 14;
+    # SQLITE_BUSY is 5. The hint was simply wrong, and a wrong hint is worse than
+    # no hint because it is a confident one.
+    #
+    # mailroom is the database that lands in this state, and the reason is timing
+    # rather than damage: its writers are short-lived, and SQLite deletes the -wal
+    # on the last clean close, so at 03:00 there is nothing to read. The other five
+    # keep a persistent connection, keep a live -wal, and never reach this branch -
+    # which is why their success is not evidence that mailroom is fine.
+    if sqlite3 "$dbpath" ".backup '${tmp}'" 2>"$STAGE/.tmp/${name}.err"; then
+      rm -f "$STAGE/.tmp/${name}.err"
+    else
+      # FALLBACK: copy main + -wal into writable staging, then dump the copy.
+      #
+      # WHY THE -wal COMES TOO. Copying the main file alone would look like a fix
+      # and be a regression: with a writer attached, recent commits live only in
+      # the -wal, so a main-only copy is a view as of the last checkpoint -
+      # arbitrarily stale. Copying main while a checkpoint is writing pages back
+      # can also be a page-granularity torn read, and integrity_check may pass on a
+      # torn-but-plausible copy. Copying the pair and letting SQLite replay the WAL
+      # on the writable copy preserves the same fidelity as the primary path.
+      #
+      # The -shm is deliberately NOT copied: it is rebuildable and SQLite creates
+      # its own on the writable copy.
+      #
+      # WHY NOT JUST MOUNT THOSE DIRECTORIES rw. Because opening a WAL database
+      # writable is not passive: SQLite would create and later delete -wal/-shm,
+      # may run WAL recovery, and closing the last connection can trigger a
+      # checkpoint that writes into the LIVE main file. The failure mode would not
+      # be "the backup is wrong", it would be "the backup perturbed the thing it
+      # was backing up" - and it would contradict the wrapper's documented
+      # `-v /srv:/srv:ro` contract.
+      #
+      # RESIDUAL RISK, stated rather than papered over: the copy is not atomic. In
+      # the presence of a mid-copy checkpoint, copying main+wal can still be torn.
+      # The mitigations are the integrity_check below and the fact that this branch
+      # is only reached for a database that was unopenable read-only, which in
+      # practice means no -wal, which means no checkpoint in flight.
+      local cpdir=$STAGE/.tmp/${name}.src
+      rm -rf "$cpdir"
+      install -d -m 0700 "$cpdir"
+      cp -p "$dbpath" "$cpdir/${name}.db" \
+        || die "${name}: .backup failed ($(tail -n1 "$STAGE/.tmp/${name}.err" 2>/dev/null)) and cp of the main file failed too"
+      if [[ -f ${dbpath}-wal ]]; then
+        cp -p "${dbpath}-wal" "$cpdir/${name}.db-wal" \
+          || die "${name}: cp of ${dbpath}-wal failed"
+        log "WARNING: ${name}: .backup failed; falling back to a staged copy INCLUDING -wal (uncheckpointed commits preserved)"
+      else
+        log "WARNING: ${name}: .backup failed and no -wal exists at dump time; falling back to a staged copy of the quiescent main file"
+      fi
+      sqlite3 "$cpdir/${name}.db" ".backup '${tmp}'" \
+        || die "${name}: .backup failed on the staged copy as well (SQLITE_CANTOPEN=14 is not a lock; check the mount and the -wal)"
+      rm -rf "$cpdir"
+      rm -f "$STAGE/.tmp/${name}.err"
+      log "${name}: staged-copy fallback succeeded"
+    fi
+
     sqlite3 "$tmp" "VACUUM INTO '${out}'" || die "${name}: VACUUM INTO failed"
     sqlite3 "$out" 'PRAGMA integrity_check;' | grep -qx ok \
       || die "${name}: dumped copy fails integrity_check"
-    log "sqlite ${name} -> $(stat -c %s "$out")B"
+    sz=$(stat -c %s "$out")
+    (( sz > 4096 )) || die "${name}: dumped copy implausibly small (${sz}B)"
+    log "sqlite ${name} -> ${sz}B"
     rm -f "$tmp"
   done
 

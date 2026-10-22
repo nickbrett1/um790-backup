@@ -17,7 +17,8 @@
 #   restore-md   render /srv/RESTORE.md, which preflight refuses to run without
 #   keys         generate the two ed25519 identities (never printed, never moved)
 #   known-hosts  pin the NAS host key on the NON-DEFAULT port 2222
-#   nas-keys     install the ryzen public key for nick@nas (prompts once)
+#   nas-keys     install the ryzen public key for nick@nas (prompts once), and
+#                the restic public key for restic@nas (via sudo, no prompt)
 #   repo         assert share + sftp user, then restic init if uninitialised
 #   verify       re-assert every preflight gate for real, then clear the lock
 #
@@ -322,7 +323,13 @@ step_keys() {
 
 step_known_hosts() {
   local pinned live tmp
-  pinned=$(ssh-keygen -F "[${NAS_HOST}]:${NAS_PORT}" -f "$KNOWN_HOSTS" -l 2>/dev/null | awk '{print $2}' | sort -u || true)
+  # Both sides go through `ssh-keygen -lf -` so they hash the SAME thing: raw key
+  # lines in, fingerprints out. Reading a file with `-l` prints `[host] RSA
+  # SHA256:...`, where $2 is the key TYPE, while `-lf -` prints `256 SHA256:...`,
+  # where $2 is the fingerprint. Comparing those two can never match, which made
+  # this step FATAL "host key has CHANGED" on every second run.
+  pinned=$(ssh-keygen -F "[${NAS_HOST}]:${NAS_PORT}" -f "$KNOWN_HOSTS" 2>/dev/null \
+             | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' | sort -u || true)
   live=$(ssh-keyscan -p "$NAS_PORT" -T 5 "$NAS_HOST" 2>/dev/null | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' | sort -u || true)
 
   if [[ -z $live ]]; then
@@ -369,6 +376,32 @@ step_nas_keys() {
   nas_ssh "sudo -n true" >/dev/null 2>&1 \
     || die "${NAS_USER} cannot sudo without a password on the NAS. The snapshot phase needs it (synosharesnapshot is root-only). Add ${NAS_USER} to the administrators group in DSM."
   ok "passwordless sudo on the NAS works"
+
+  # `keys` mints the restic identity but nothing installed it, so `repo` could not
+  # open a repo that existed and would try to init over the top of one. Provision
+  # it here, next to the other NAS-side key step. Append-only, idempotent, and
+  # matched on the base64 body so a `restrict,command=...` prefix on an existing
+  # entry does not defeat the check.
+  local restic_pub restic_body authz
+  restic_pub=$(cat "${RESTIC_SSH_KEY}.pub")
+  restic_body=$(awk '{print $2}' "${RESTIC_SSH_KEY}.pub")
+  authz="/var/services/homes/${RESTIC_USER}/.ssh/authorized_keys"
+
+  if nas_ssh "sudo -n grep -qF '${restic_body}' '${authz}'" >/dev/null 2>&1; then
+    ok "restic public key already authorised for ${RESTIC_USER}@${NAS_HOST}"
+  else
+    if (( CHECK )); then die "restic public key is not authorised for ${RESTIC_USER}@${NAS_HOST} (the repo step would try to init over an existing repository)"; fi
+    log "installing the restic public key for ${RESTIC_USER}@${NAS_HOST}"
+    # Same restriction as the key already in place: this account exists to carry
+    # the sftp transport, and a bare key would hand it a login shell.
+    # tee runs as root, so ownership and mode are restored afterwards.
+    printf 'restrict,command="internal-sftp" %s\n' "$restic_pub" \
+      | nas_ssh "sudo -n tee -a '${authz}' >/dev/null" \
+      || die "could not install ${RESTIC_SSH_KEY}.pub for ${RESTIC_USER}. Manual fallback: append it to ${authz} on the NAS (directory 0700, file 0600, owner ${RESTIC_USER})."
+    nas_ssh "sudo -n chown ${RESTIC_USER}:users '${authz}' && sudo -n chmod 0600 '${authz}'" >/dev/null 2>&1 \
+      || warn "installed the restic key but could not restore ownership/mode on ${authz} - check it is ${RESTIC_USER}:users 0600"
+    ok "restic public key installed for ${RESTIC_USER}@${NAS_HOST}"
+  fi
 }
 
 step_repo() {
@@ -393,6 +426,15 @@ step_repo() {
     return 0
   fi
   if (( CHECK )); then die "cannot open ${REPOSITORY} (not initialised, wrong password, or key/share problem)"; fi
+
+  # `cat config` fails identically for "not initialised" and "cannot
+  # authenticate", and initialising in the second case is how a wrong key or
+  # password turns into a destructive command. A repo directory that already
+  # holds `config` is NOT uninitialised, so an init would be wrong whatever the
+  # reason for the failure - say which problem it is instead of guessing.
+  if nas_ssh_works && nas_ssh "sudo -n test -f /volume1/${SHARE}/um790/config" >/dev/null 2>&1; then
+    die "${REPOSITORY} already holds a repository (config is present) but cannot be opened. That is an access problem - wrong RESTIC_PASSWORD, or ${RESTIC_SSH_KEY}.pub not authorised for ${RESTIC_USER} - and restic init would be the wrong response."
+  fi
 
   warn "repository does not open - initialising ${REPOSITORY}"
   warn "restic init only destroys anything if the path above is WRONG, so read it before continuing"

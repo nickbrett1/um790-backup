@@ -27,6 +27,8 @@
 #   DAGU_DAGS_TOKEN            overrides the Doppler lookup (local use)
 #   UM790_BACKUP_IMAGE_SHA     tag to pin (default: $BUILDKITE_COMMIT)
 #   UM790_BACKUP_REPO_SLUG     default nickbrett1/dagu-dags
+#   UM790_BACKUP_SRC_REPO_SLUG default nickbrett1/um790-backup (the repo whose
+#                              history the backwards-pin guard asks about)
 #   UM790_BACKUP_DAG_PATH      default dags/ryzen/um790-backup.yaml.disabled
 #   UM790_BACKUP_BRANCH        default auto/um790-backup-pin
 #   UM790_BACKUP_IMAGE_NAME    default ghcr.io/nickbrett1/um790-backup
@@ -42,12 +44,20 @@
 #     in. Presence and emptiness are separate questions; now asked separately.
 #  2. Merging moved from a human to this script. A human used to be able to see a
 #     stale build re-pinning an older image; that eye is gone, so the ancestry
-#     guard below took its place.
+#     guard took its place.
+#  3. The first cut of that guard could never fire. It resolved the source
+#     checkout as ${BUILDKITE_BUILD_CHECKOUT_PATH:-$PWD} AFTER `cd` into the
+#     throwaway dagu-dags clone, so it looked for .git in the wrong repo, failed
+#     the check, and stood aside - logging a reassuring "cannot verify ancestry"
+#     on every run. Build 41 is the proof: it merged while claiming the guard was
+#     skipped. It now asks the GitHub compare API instead of local git, which has
+#     no cwd to get wrong and no dependency on how deep the checkout was cloned.
 set -Eeuo pipefail
 IFS=$'\n\t'
 
 API=https://api.github.com
 REPO=${UM790_BACKUP_REPO_SLUG:-nickbrett1/dagu-dags}
+SRC_REPO=${UM790_BACKUP_SRC_REPO_SLUG:-nickbrett1/um790-backup}
 DAG_PATH=${UM790_BACKUP_DAG_PATH:-dags/ryzen/um790-backup.yaml.disabled}
 BRANCH=${UM790_BACKUP_BRANCH:-auto/um790-backup-pin}
 IMAGE=${UM790_BACKUP_IMAGE_NAME:-ghcr.io/nickbrett1/um790-backup}
@@ -79,6 +89,16 @@ if [[ -z $TOKEN ]]; then
 fi
 [[ -n $TOKEN ]] \
   || die "DAGU_DAGS_TOKEN resolved empty - create it in Doppler (common/prd) with access to ${REPO}"
+
+# One caller for every GitHub call below. -sS so a transport error is still
+# visible on stderr; no -f, so the caller decides what a 4xx means.
+ghapi() {
+  curl -sS \
+    -H "Authorization: Bearer $TOKEN" \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'X-GitHub-Api-Version: 2022-11-28' \
+    "$@"
+}
 
 # ---------------------------------------------------------------------------
 # clone
@@ -121,26 +141,37 @@ fi
 #
 # Auto-merge removed the person who would have read the PR title and noticed that
 # a *retried* or out-of-order build was about to re-pin an older image. Retrying
-# an old build is normal here (build 40 was itself a retry), so this is not
-# hypothetical. A pin is only allowed to move forward along first-parent history
-# of the source repo, which is the checkout this script runs in.
+# an old build is normal here - build 40 was itself a retry - so this is not
+# hypothetical: build 41 proves it, because without a working guard a retry of
+# build 40 would have re-pinned 2a936dc over 2e151fe.
 #
-# If the ancestry cannot be established locally, the guard stands aside and says
-# so rather than blocking: it must not become a new way for the bump to die.
+# The comparison is a question for GitHub about the SOURCE repo's history, not a
+# local `merge-base`. Local git was the first attempt and it could not work: the
+# script has already `cd`ed into the dagu-dags clone, and a --depth 1 checkout has
+# no history to walk anyway. Both failure modes ended in `|| true`-shaped silence.
+#
+# compare/{base}...{head} reports head relative to base:
+#   ahead     -> SHA descends from the pin; a normal forward bump
+#   behind    -> the pin is newer; this build is stale, refuse
+#   diverged  -> not a fast-forward; refuse
+# An unreachable API is NOT treated as a rollback: the guard warns and steps
+# aside, because it must not become a new way for a green build to fail.
 # A deliberate rollback is a hand edit, which is the right place for it.
 # ---------------------------------------------------------------------------
 CURRENT_SHA=${current##*:}
-if [[ -n $CURRENT_SHA && $CURRENT_SHA =~ ^[0-9a-f]{40}$ ]]; then
-  SRC_DIR=${BUILDKITE_BUILD_CHECKOUT_PATH:-$PWD}
-  if [[ -d ${SRC_DIR}/.git ]] \
-    && git -C "$SRC_DIR" cat-file -e "${CURRENT_SHA}^{commit}" 2>/dev/null \
-    && git -C "$SRC_DIR" cat-file -e "${SHA}^{commit}" 2>/dev/null; then
-    git -C "$SRC_DIR" merge-base --is-ancestor "$CURRENT_SHA" "$SHA" \
-      || die "refusing to pin ${SHORT}: it is not a descendant of the currently pinned ${CURRENT_SHA:0:12}, so this would roll the pin backwards. If that is intended, edit ${DAG_PATH} by hand."
-    log "${SHORT} is a descendant of the current pin ${CURRENT_SHA:0:12}"
-  else
-    log "cannot verify ancestry in '${SRC_DIR}' - skipping the backwards-pin guard"
-  fi
+if [[ $CURRENT_SHA =~ ^[0-9a-f]{40}$ && $CURRENT_SHA != "$SHA" ]]; then
+  compare=$(ghapi "${API}/repos/${SRC_REPO}/compare/${CURRENT_SHA}...${SHA}" 2>/dev/null || true)
+  status=$(jq -r '.status // empty' <<<"$compare" 2>/dev/null || true)
+  case $status in
+    ahead)
+      log "${SHORT} is ahead of the pinned ${CURRENT_SHA:0:12} in ${SRC_REPO}" ;;
+    behind|diverged)
+      die "refusing to pin ${SHORT}: ${SRC_REPO} reports it is '${status}' relative to the pinned ${CURRENT_SHA:0:12}, so this would roll the pin backwards. If that is intended, edit ${DAG_PATH} by hand." ;;
+    *)
+      log "WARNING: could not confirm ${SHORT} descends from the pinned ${CURRENT_SHA:0:12} (compare API gave '${status:-no answer}'); pinning anyway" ;;
+  esac
+elif [[ -n $CURRENT_SHA && ! $CURRENT_SHA =~ ^[0-9a-f]{40}$ ]]; then
+  log "WARNING: pinned value '${CURRENT_SHA}' is not a full commit SHA - skipping the backwards-pin guard"
 fi
 
 sed -i -E "s|^([[:space:]]*UM790_BACKUP_IMAGE:[[:space:]]*)\"[^\"]*\"[[:space:]]*\$|\1\"${TAG}\"|" "$DAG_PATH"
@@ -183,14 +214,6 @@ HEAD_SHA=$(git rev-parse HEAD)
 OWNER=${REPO%%/*}
 ENCODED_BRANCH=${BRANCH//\//%2F}
 
-ghapi() {
-  curl -sS \
-    -H "Authorization: Bearer $TOKEN" \
-    -H 'Accept: application/vnd.github+json' \
-    -H 'X-GitHub-Api-Version: 2022-11-28' \
-    "$@"
-}
-
 existing=$(ghapi "${API}/repos/${REPO}/pulls?head=${OWNER}:${ENCODED_BRANCH}&state=open") \
   || die "cannot list open PRs for ${REPO}"
 
@@ -199,7 +222,7 @@ if [[ -n $PR_NUMBER ]]; then
   log "PR #${PR_NUMBER} is already open; branch refreshed to ${SHORT}"
 else
   PR_BODY=$(cat <<EOF
-Automated pin bump from a green build of \`nickbrett1/um790-backup\`, merged by CI.
+Automated pin bump from a green build of \`${SRC_REPO}\`, merged by CI.
 
 - image: \`${TAG}\`
 - build: ${BUILDKITE_BUILD_URL:-not a Buildkite run}

@@ -174,9 +174,17 @@ steps:
           --label org.opencontainers.image.revision=$$BUILDKITE_COMMIT \
           -t $$IMAGE:$$BUILDKITE_COMMIT -t $$IMAGE:latest --push .
 
-  # Promotion, not deployment. A green build lands as a one-line diff in the DAG
-  # repository, on a branch, for a human to merge - the pin is never edited by
-  # hand again, and nothing reaches the NAS without a review step.
+  # Promotion, not deployment. A green build lands as a one-line pin bump against
+  # the DAG repository, and scripts/bump-dagu-pin.sh then MERGES it itself: the
+  # PR exists as the audit record, not as a queue for a human. Set
+  # UM790_BACKUP_NO_MERGE=1 to leave it open for review instead.
+  #
+  # Do not describe this step as gated on a human. It runs unattended, and the
+  # merge is live on the host within about a minute (dagu-dags-autocommit pulls
+  # every minute), so there is no review window in which a bad pin could be
+  # caught. The protection is the script's own guards - the compare-API check
+  # that refuses to move the pin backwards, and the assert that exactly two lines
+  # changed - not a reviewer.
   #
   # Why not have the DAG track a tag and pull it: the phases are separate
   # `docker run --rm` invocations, so an image that changes between them makes a
@@ -190,8 +198,20 @@ steps:
     key: dagu_pin_bump
     depends_on:
       - docker_publish
-    # `.disabled` is never enabled by this step: merging the PR sets the pin, and
-    # enabling the schedule stays a separate rename by a human.
+    # This step edits exactly one line: UM790_BACKUP_IMAGE in
+    # dags/ryzen/um790-backup.yaml. It cannot enable a schedule, because the
+    # schedule is a KEY in the DAG rather than a property of the filename - and
+    # that DAG carries no such key. Adding one stays a separate, deliberate edit.
+    #
+    # A `.disabled` SUFFIX IS NOT THE MECHANISM and must not be reintroduced.
+    # Dagu 2.21.0 discovers `*.yaml`/`*.yml` only, so a `.disabled` file is
+    # invisible to `dagu ls` yet still runnable by absolute path - which is how
+    # this DAG was hand-run five times on 2026-10-22. That suffix was retired
+    # when the DAG became a managed definition, and this step still pointed at
+    # the old spelling: build 54 published its image successfully and then died
+    # here, leaving the mailroom sqlite fix built but unpinned. The path default
+    # now matches the real file, and a miss lists the DAG files that DO exist
+    # rather than only the one it wanted.
     if: build.branch == "main"
     agents:
       queue: mac-studio-linux

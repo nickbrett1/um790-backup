@@ -43,8 +43,52 @@
 /srv/.um790-backup/ssh
 /srv/.um790-backup/staging/.tmp
 
-# Backup targets and other machines' data: large, and not ours to restore.
-/srv/backups
+# /srv/backups — this host's OWN backup output, deliberately PART-covered.
+#
+# The blanket `/srv/backups` line that used to live here was justified as
+# "other machines' data: large, and not ours to restore". That was wrong on the
+# facts. The directory has exactly three children and every one of them is this
+# host's own service data. Verified 2026-10-22: no bind mounts, no nested
+# mounts, no symlink escaping the tree (the one symlink is
+# obsidian-vault/latest.tar.gz -> a file in the same directory, relative).
+#
+#   potato/          1.6M   potato-backup DAG output: project.sqlite + state tar
+#   obsidian-vault/  20M    obsidian-vault-backup DAG output: nightly tarball
+#   msgvault/        5.8G   msgvault-native repo, 73 snapshots to 2026-08-16
+#
+# The first two are now INCLUDED. They are small, clean (no special files, no
+# hardlinks, not sparse) and append-only at one file per day, so restic dedup
+# stores roughly 2.6M/night. Excluding them meant those two DAGs were writing
+# backups onto the same NVMe partition they exist to protect: /srv/backups and
+# /srv are one ext4 filesystem on /dev/nvme0n1p2 (same st_dev 66306), and
+# nothing on this host moves the directory off it - no rsync/rclone/scp/
+# syncthing/btrfs-send in the DAG repo or /srv/stack, empty user crontab, stock
+# /etc/cron.d, all stock systemd timers, no NFS/SMB export.
+#
+# msgvault/ by contrast stays EXCLUDED, and is slated for deletion once the
+# msgvault-backup DAG is disabled:
+#   - its subject, /srv/msgvault/msgvault.db, is dumped by the dumps phase AND
+#     copied raw by the /srv walk, so this repo is a third copy of the same data;
+#   - nothing prunes it. 73 .mvmanifest snapshots back to repo creation
+#     (2026-08-16), growing without bound, 5.8G today;
+#   - config.toml says encryption = "none", so it is an unencrypted plaintext
+#     second copy of the entire mail archive sitting on a share.
+# ORDER MATTERS on removal: disable the DAG BEFORE deleting the directory, or
+# its next 04:00 tick recreates it. compose mounts /srv/backups/msgvault:/backup
+# and the DAG runs `msgvault backup create --repo /backup`.
+#
+# WHY THE CHILDREN ARE NAMED RATHER THAN THE PARENT PLUS A NEGATION: restic
+# 0.18.1 has no negation syntax at all. A `!/srv/backups/something` line is
+# treated as a literal path pattern starting with '!', matches nothing, and
+# produces no warning and no error - verified empirically against the pinned
+# binary, not inferred from docs. The only way to include a subdirectory of an
+# excluded parent is to narrow or drop the parent exclusion, which is what this
+# block does. (The `restic help backup` exclude surface offers only
+# --exclude, --iexclude, their -file forms, --exclude-if-present,
+# --exclude-caches and --exclude-larger-than.)
+/srv/backups/msgvault
+
+# Other machines' data: large, and not ours to restore.
 /srv/marketdata
 
 # Postgres data directories. The database contents are covered by pg_dump in the

@@ -110,7 +110,7 @@ SNAPSHOT_MAX_AGE="${SNAPSHOT_MAX_AGE:-$((6 * 3600))}"
 # inline at the two call sites in do_prune so the offline test can apply the SAME
 # arguments to a throwaway repository and assert what survives - a test that
 # restated the policy would drift from it silently.
-RESTIC_KEEP_ARGS=(--keep-daily 7 --keep-weekly 4 --keep-monthly 6)
+RESTIC_KEEP_ARGS=(--keep-daily 14 --keep-weekly 4 --keep-monthly 6)
 
 # The size guard catches a WRONG MOUNT, not normal growth. It is measured with
 # the exclude list applied (see measure_source_gb), because the raw /srv total

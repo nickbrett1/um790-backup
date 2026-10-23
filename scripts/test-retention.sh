@@ -15,9 +15,9 @@
 # regression test for that, and the reason a --dry-run gate was not enough.
 #
 # COST, because it is a real constraint: every keep-policy snapshot is a real
-# restic backup, and this step is the slowest in CI. It is currently 10 backups.
-# Add a case only if it can fail in a way the existing ones cannot, and keep its
-# snapshot count small.
+# restic backup, and this step is the slowest in CI. It scales with the policy
+# (KEEP_DAILY + 3, so 17 backups with --keep-daily 14). Add a case only if it
+# can fail in a way the existing ones cannot, and keep its snapshot count small.
 #
 # THE DELETE-COMMAND AND GUARD SECTIONS (4 and 5) COST NO BACKUPS. They are pure
 # bash plus stubbed calls, so they run in milliseconds. That is why the refusal
@@ -235,81 +235,122 @@ kept_epochs() {
 # Distinct consecutive days is the real shape (one run per day) and immune to the
 # thing I could not pin down: a uniform timezone offset shifts every snapshot
 # equally, so it can neither merge two dates nor split one date in two. Whatever
-# restic does with day boundaries, ten consecutive days remain ten days. That
+# restic does with day boundaries, consecutive days remain consecutive days. That
 # makes this an assertion about the POLICY rather than about the build machine's
 # clock.
 #
 # WHAT `forget` ACTUALLY KEEPS, and why the assertions are shaped this way.
 #
 # restic keeps the UNION of the policies, not the intersection and not just the
-# most specific one. With --keep-daily 7 --keep-weekly 4 --keep-monthly 6 over ten
-# consecutive days, it keeps the last 7 days PLUS one representative from the
-# earlier calendar week - 8 snapshots, and the oldest survivor is OLDER than the
-# daily window. Build 35 asserted exactly 7 and failed with 8.
+# most specific one. Under the old --keep-daily 7 --keep-weekly 4
+# --keep-monthly 6 over ten consecutive days, it kept the last 7 days PLUS one
+# representative from the earlier calendar week - 8 snapshots, and the oldest
+# survivor was OLDER than the daily window. Build 35 asserted exactly 7 and
+# failed with 8.
 #
 # That extra survivor is the entire point of --keep-weekly: it extends history
-# beyond the daily window. So this case covers weekly/monthly after all, and does
-# it in 10 backups - which is why a separate 30-snapshot case was cut. When this
-# case was first written the claim was the opposite ("weekly cannot raise the
-# count"); the build disproved it, so the assertions now prove the extension
+# beyond the daily window. So this case covers weekly/monthly after all, in
+# KEEP_DAILY + 3 backups - which is why a separate 30-snapshot case was cut. When
+# this case was first written the claim was the opposite ("weekly cannot raise
+# the count"); the build disproved it, so the assertions now prove the extension
 # rather than assume it away.
 #
-# Deliberately does NOT assert an exact surviving count: 8 here depends on which
-# calendar week the month starts in, so it would be a date-dependent number
+# Deliberately does NOT assert an exact surviving count: it depends on which
+# calendar week the fixture starts in, so it would be a date-dependent number
 # dressed up as a policy fact. The properties asserted below follow from the
 # documented behaviour and hold whatever day of the week the fixture starts on.
 section "keep-daily on consecutive days"
 
-repo_fresh "$TMP/repo_daily"
-JAN1=$(date -u -d '2026-01-01 03:00:00' +%s)
-day_epoch() { printf '%s' "$(( JAN1 + $1 * 86400 ))"; }   # 0-based day offset
-for ((d = 0; d < 10; d++)); do
-  snap "$(date -u -d "@$(day_epoch "$d")" +%Y-%m-%dT03:00:00Z)"
+# THE FIXTURE IS DERIVED FROM THE POLICY, not hardcoded, for the same reason the
+# arguments themselves are read from the runner: a policy change has to be
+# thought about here. The previous version built exactly ten days and asserted
+# that pruning happened, which is only true while --keep-daily is below ten. When
+# it went to 14 the fixture sat entirely inside the daily window, nothing pruned,
+# and the "did it prune at all" check below failed by construction - the test was
+# asserting the old number, not the policy.
+#
+# Parse the daily window out of the array. Both forms the array could plausibly
+# use are accepted (`--keep-daily 14` and `--keep-daily=14`); anything else
+# leaves KEEP_DAILY at its sentinel and is caught by the guard.
+KEEP_DAILY=0
+prev=
+for a in "${RESTIC_KEEP_ARGS[@]}"; do
+  [[ $prev == --keep-daily ]] && KEEP_DAILY=$a
+  [[ $a == --keep-daily=* ]] && KEEP_DAILY=${a#--keep-daily=}
+  prev=$a
 done
-eq "records 10 consecutive daily snapshots" "$(count)" "10"
 
-restic forget --quiet "${RESTIC_TEST_OPTS[@]}" "${RESTIC_KEEP_ARGS[@]}" >/dev/null
-
-mapfile -t KEPT < <(kept_epochs)
-n_kept=${#KEPT[@]}
-
-# It must have pruned at all: if forget were a no-op (wrong args, swallowed
-# failure) the count stays at 10 and every assertion below still passes on the
-# untouched repo. So the pruning itself is asserted first.
-if (( n_kept < 10 )); then
-  pass "forget pruned the repository (${n_kept} of 10 survived)"
-else
-  fail "forget kept all 10 snapshots - it did not prune, so nothing below is meaningful"
+# GUARD IT LOUDLY. A parse that silently yields 0 is worse than one that yields
+# nothing: DAYS collapses to 3, the "daily window" covers the whole fixture, and
+# every assertion below passes without exercising the policy at all - the exact
+# failure mode this file's header warns about.
+if ! [[ $KEEP_DAILY =~ ^[0-9]+$ ]] || (( KEEP_DAILY < 1 )); then
+  fail "could not parse --keep-daily from RESTIC_KEEP_ARGS (got '$KEEP_DAILY')"
 fi
 
-# keep-daily 7 keeps the last seven DAYS, so days 3..9 (0-based) must survive.
-# Asserted individually rather than as a count: a count of 8 would also pass if
-# forget kept one day twice and dropped another. Collecting the misses rather
-# than setting a flag means the failure names the days that went missing.
-dropped=()
-for ((d = 3; d < 10; d++)); do
-  want=$(day_epoch "$d")
-  printf '%s\n' "${KEPT[@]}" | grep -qx "$want" || dropped+=("day $d")
-done
-if (( ${#dropped[@]} == 0 )); then
-  pass "all 7 days of the keep-daily window survive"
-else
-  fail "keep-daily 7 dropped snapshots it should retain: ${dropped[*]}"
-fi
+# The rest of the section is meaningless without a real window, so it does not
+# run against the bogus DAYS a failed parse would produce.
+if [[ $KEEP_DAILY =~ ^[0-9]+$ ]] && (( KEEP_DAILY >= 1 )); then
 
-# The newest snapshot must survive. This is the one outcome that makes the rest
-# of the policy worthless if it is wrong.
-eq "the newest snapshot survives the policy" \
-  "${KEPT[-1]}" "$(day_epoch 9)"
+  # Three days beyond the window so there is always something outside it to
+  # prune, whatever the window is. This is the whole fixture size, and it is why
+  # this section costs KEEP_DAILY + 3 real restic backups: do not shrink it by
+  # weakening the assertions.
+  DAYS=$(( KEEP_DAILY + 3 ))
 
-# And at least one snapshot OLDER than the daily window must survive, which is
-# --keep-weekly doing its job. Without this the policy would be indistinguishable
-# from --keep-daily 7 alone, and the weekly/monthly args could be deleted with no
-# test noticing.
-if (( KEPT[0] < $(day_epoch 3) )); then
-  pass "weekly/monthly extend history past the daily window (oldest kept predates it)"
-else
-  fail "nothing older than the daily window survived - keep-weekly/keep-monthly are not taking effect"
+  repo_fresh "$TMP/repo_daily"
+  JAN1=$(date -u -d '2026-01-01 03:00:00' +%s)
+  day_epoch() { printf '%s' "$(( JAN1 + $1 * 86400 ))"; }   # 0-based day offset
+  for ((d = 0; d < DAYS; d++)); do
+    snap "$(date -u -d "@$(day_epoch "$d")" +%Y-%m-%dT03:00:00Z)"
+  done
+  eq "records ${DAYS} consecutive daily snapshots" "$(count)" "$DAYS"
+
+  restic forget --quiet "${RESTIC_TEST_OPTS[@]}" "${RESTIC_KEEP_ARGS[@]}" >/dev/null
+
+  mapfile -t KEPT < <(kept_epochs)
+  n_kept=${#KEPT[@]}
+
+  # It must have pruned at all: if forget were a no-op (wrong args, swallowed
+  # failure) the count stays at DAYS and every assertion below still passes on
+  # the untouched repo. So the pruning itself is asserted first.
+  if (( n_kept < DAYS )); then
+    pass "forget pruned the repository (${n_kept} of ${DAYS} survived)"
+  else
+    fail "forget kept all ${DAYS} snapshots - it did not prune, so nothing below is meaningful"
+  fi
+
+  # keep-daily N keeps the last N DAYS, so days KEEP_DAILY-1..DAYS-1 (0-based)
+  # must survive. Asserted individually rather than as a count: a count would
+  # also pass if forget kept one day twice and dropped another. Collecting the
+  # misses rather than setting a flag means the failure names the days that went
+  # missing.
+  dropped=()
+  for ((d = KEEP_DAILY - 1; d < DAYS; d++)); do
+    want=$(day_epoch "$d")
+    printf '%s\n' "${KEPT[@]}" | grep -qx "$want" || dropped+=("day $d")
+  done
+  if (( ${#dropped[@]} == 0 )); then
+    pass "all ${KEEP_DAILY} days of the keep-daily window survive"
+  else
+    fail "keep-daily ${KEEP_DAILY} dropped snapshots it should retain: ${dropped[*]}"
+  fi
+
+  # The newest snapshot must survive. This is the one outcome that makes the rest
+  # of the policy worthless if it is wrong.
+  eq "the newest snapshot survives the policy" \
+    "${KEPT[-1]}" "$(day_epoch $(( DAYS - 1 )))"
+
+  # And at least one snapshot OLDER than the daily window must survive, which is
+  # --keep-weekly doing its job. Without this the policy would be
+  # indistinguishable from --keep-daily N alone, and the weekly/monthly args
+  # could be deleted with no test noticing.
+  if (( KEPT[0] < $(day_epoch $(( KEEP_DAILY - 1 ))) )); then
+    pass "weekly/monthly extend history past the daily window (oldest kept predates it)"
+  else
+    fail "nothing older than the daily window survived - keep-weekly/keep-monthly are not taking effect"
+  fi
+
 fi
 
 # ---------------------------------------------------------------------------

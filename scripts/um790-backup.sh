@@ -1217,11 +1217,42 @@ do_status() {
   require_cmds restic jq
 
   local snapshots bytes duration tmp run_id started
+  local containers pg sqlite
   snapshots=$(restic_run snapshots --json | jq 'length')
   bytes=$(restic_run stats --mode raw-data --json | jq -r '.total_size // 0')
   run_id=$(cat "$STATE/run.lock" 2>/dev/null || echo unknown)
   started=$(cat "$STATE/backup_start.epoch" 2>/dev/null || stamp)
   duration=$(( $(stamp) - started ))
+
+  # COVERAGE, read back off staging: this run wrote it, the next preflight wipes
+  # it, so these describe THIS backup rather than a leftover.
+  #
+  # The container count is the config phase's `docker ps -a` roster, so it counts
+  # every container the daemon knows about - EXITED ONE-SHOTS INCLUDED - and not
+  # "containers whose data was backed up". What the backup captures per container
+  # is its inspect/config JSON; the writable layer and anonymous volumes are never
+  # in it. That is why the body says "N containers" and must never be reworded to
+  # "N containers backed up": the number is evidence the daemon was reachable and
+  # its roster reached the snapshot, i.e. a wrong-docker-context tripwire, not a
+  # per-container data guarantee.
+  #
+  # The dump counts are the same quantities assert_snapshot_contents proved are IN
+  # the snapshot, so they are a claim about the backup and not about staging. A
+  # failed dump makes do_dumps die, so status is unreachable with a short set -
+  # they are COUNTED anyway rather than read from ${#PG_CONTAINERS[@]}, so that if
+  # that ever stops being true the message shows reality instead of restating an
+  # expectation.
+  #
+  # `|| true` is load-bearing under `set -Eeuo pipefail`: `grep -c .` prints 0 and
+  # exits 1 on an empty file, and without it the assignment would abort the shell
+  # here - AFTER the heartbeat is written and the lock released, so the run would
+  # look broken and the message would be lost.
+  containers=$(grep -c . "$STAGE/config/containers.txt" 2>/dev/null || true)
+  containers=${containers:-0}
+  pg=$(find "$STAGE/pg" -name '*.dump' -type f 2>/dev/null | grep -c . || true)
+  pg=${pg:-0}
+  sqlite=$(find "$STAGE/sqlite" -name '*.db' -type f 2>/dev/null | grep -c . || true)
+  sqlite=${sqlite:-0}
 
   # Written to a temp file and renamed, so a reader never sees half a heartbeat.
   tmp=$STATE/.last_success.$$
@@ -1232,6 +1263,9 @@ do_status() {
   "run_id": "${run_id}",
   "repo": "${RESTIC_REPOSITORY}",
   "snapshots": ${snapshots},
+  "containers": ${containers},
+  "pg_dumps": ${pg},
+  "sqlite_dumps": ${sqlite},
   "repo_bytes": ${bytes},
   "duration_sec": ${duration},
   "snapshot_retention_days": ${SNAPSHOT_RETENTION_DAYS}
@@ -1248,7 +1282,7 @@ EOF
   # when you are the one glancing at a phone at 07:00:
   #
   #   1. THE RUN ID. `run_id` is Dagu's internal ULID (26 chars, base32). On a
-  #      notification it sits between the reader and the three numbers they
+  #      notification it sits between the reader and the numbers they
   #      actually wanted, and it answers a question nobody asks at that moment:
   #      which run was this. It is NOT lost by dropping it - it is in
   #      last_success.json (written two lines above), in the restic snapshot's
@@ -1260,9 +1294,16 @@ EOF
   #      the pointer to the run in order to investigate, and a FAILED message is
   #      read rather than glanced at.
   #
-  #   2. "1 snapshots". The count is printed in two places - this body and the log
-  #      line below - so it is pluralised once, here, rather than by rewording
-  #      either site.
+  #   2. THE SNAPSHOT COUNT, which was worse than uninteresting. It is
+  #      `restic snapshots | length`, i.e. what retention has left, so it drifts
+  #      with the keep policy and can read 1 on a perfectly healthy week - a
+  #      number that answers a retention question for the dashboard, not "did
+  #      last night's backup work", which is what the body is for. Worse, it
+  #      understates a healthy backup, so the failure it invites is a reader
+  #      learning to ignore the one line that tells them the backup is fine.
+  #      What replaces it describes COVERAGE, which is what a glance is actually
+  #      checking. The count is not lost: it stays in last_success.json and in
+  #      the log line below.
   #
   # Deliberately NOT changed: `numfmt --to=iec` renders 12263703410 as "12G". That
   # is coarse (the true value is 11.42), but it is a proven call on an uncovered
@@ -1276,13 +1317,8 @@ EOF
   # lock released BEFORE the notification is attempted, so a notifier outage can
   # only cost the message - it can never withhold the heartbeat or block the next
   # run on a stale lock.
-  local noun=snapshots
-  if (( snapshots == 1 )); then
-    noun=snapshot
-  fi
-
-  notify default "um790 backup OK" "${snapshots} ${noun}, $(numfmt --to=iec "$bytes"), ${duration}s"
-  log "status written (${snapshots} ${noun}, ${bytes}B, ${duration}s)"
+  notify default "um790 backup OK" "${containers} containers, ${pg} pg + ${sqlite} sqlite dumps, $(numfmt --to=iec "$bytes"), ${duration}s"
+  log "status written (${snapshots} snapshots, ${containers} containers, ${pg} pg + ${sqlite} sqlite dumps, ${bytes}B, ${duration}s)"
 }
 
 # ---------------------------------------------------------------------------

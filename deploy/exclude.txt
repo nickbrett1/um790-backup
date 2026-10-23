@@ -3,10 +3,45 @@
 # by the preflight phase, so edit this file - not the copy on the host, which is
 # overwritten from the image on every run.
 #
-# Staging is not listed separately: it lives at /srv/.um790-backup/staging and
-# the directory below covers it. Excluding it matters or each run would back up
-# the previous run's staging.
-/srv/.um790-backup
+# DO NOT EXCLUDE $BASE (/srv/.um790-backup) AS A WHOLE.
+#
+# This list used to carry exactly that line, justified as "staging is not listed
+# separately: it lives at /srv/.um790-backup/staging and the directory below
+# covers it". That reasoning was backwards, and it silently destroyed the
+# backup. do_backup runs
+#
+#     restic backup /srv "$STAGE"
+#
+# i.e. staging is an EXPLICIT SECOND TARGET, and restic drops an explicitly
+# named path that falls beneath an excluded ancestor. The config/, pg/ and
+# sqlite/ subtrees the two preceding phases had just produced were discarded at
+# snapshot time - while every guard reported success, because do_backup's
+# completeness check reads staging on DISK and never the resulting snapshot.
+#
+# Measured against both pre-existing snapshots: 0 paths under staging, 0
+# *.dump, 0 containers.txt; only the bare parent directory was recorded. The
+# Postgres dumps are the ONLY coverage those four clusters have - their raw
+# data directories are excluded below on the grounds that pg_dump covers them -
+# so the databases had no backup by either route.
+#
+# The fix is to exclude staging's SIBLINGS instead of its parent, so the /srv
+# walk still skips runtime state while the explicit staging target survives.
+# Each entry here lives directly under $BASE:
+#
+#   state/         run.lock, *.epoch, last_success.json - runtime bookkeeping
+#   cache/         restic's local cache - rebuildable, and it churns per run
+#   ssh/           restic/NAS private keys - secrets, must never be snapshotted
+#   staging/.tmp/  dump scratch space; empty on success, but a failed run can
+#                  leave a multi-GB partial behind
+#
+# staging/config, staging/pg and staging/sqlite are deliberately NOT excluded:
+# they are the payload. Verified with this image's restic 0.18.1 - an explicit
+# target below an excluded parent contributed 0 files, the same inputs with
+# sibling-only excludes contributed 1.
+/srv/.um790-backup/state
+/srv/.um790-backup/cache
+/srv/.um790-backup/ssh
+/srv/.um790-backup/staging/.tmp
 
 # Backup targets and other machines' data: large, and not ours to restore.
 /srv/backups
@@ -14,6 +49,7 @@
 
 # Postgres data directories. The database contents are covered by pg_dump in the
 # dumps phase; copying the raw cluster would be inconsistent and far larger.
+# Note that this only holds because staging/ is no longer excluded - see above.
 /srv/docker/litellm/postgres_data
 /srv/docker/miniflux/db
 /srv/docker/miniflux-explore/db

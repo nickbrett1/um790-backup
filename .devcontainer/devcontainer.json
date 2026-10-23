@@ -1,0 +1,83 @@
+{
+  "name": "um790-backup",
+  "runArgs": [
+    "--name",
+    "um790-backup-devcontainer",
+    "--sysctl",
+    "net.ipv6.conf.all.disable_ipv6=1",
+    "--cap-add=NET_ADMIN",
+    "--device=/dev/net/tun",
+    "--stop-timeout",
+    "30"
+  ],
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "workspaceFolder": "/workspaces/um790-backup",
+  "remoteUser": "vscode",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": true,
+      "configureZshAsDefaultShell": true,
+      "installOhMyZsh": true,
+      "upgradePackages": true,
+      "username": "vscode"
+    },
+    "ghcr.io/devcontainers-extra/features/apt-packages:1": {
+      "packages": "socat"
+    }
+  },
+  "mounts": [
+    "source=um790-backup-tailscale-state,target=/var/lib/tailscale,type=volume",
+    "source=${localEnv:HOME}/.doppler,target=/home/vscode/.doppler,type=bind",
+    "source=gemini-cli-settings,target=/home/vscode/.gemini,type=volume",
+    "source=${localEnv:HOME}/.ssh,target=/home/vscode/.ssh-host,type=bind"
+  ],
+  "forwardPorts": [],
+  "containerEnv": {
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "GOOSE_STATE_MACHINE": "1"
+  },
+  "postCreateCommand": "bash .devcontainer/post-create-setup.sh",
+  "postStartCommand": "bash /workspaces/um790-backup/.devcontainer/post-start-setup.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "pcassidy75.tmux-integrated",
+        "vsc-mermaid.mermaid-preview",
+        "saoudrizwan.claude-dev",
+        "GitHub.copilot",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "svelte.svelte-vscode",
+        "usernamehw.errorlens",
+        "streetsidesoftware.code-spell-checker",
+        "eamodio.gitlens",
+        "donjayamanne.githistory",
+        "mhutchie.git-graph",
+        "redhat.vscode-yaml",
+        "tamasfe.even-better-toml",
+        "bierner.markdown-mermaid",
+        "pomdtr.excalidraw-editor",
+        "pejmannikram.vscode-auto-scroll",
+        "naumovs.color-highlight",
+        "oderwat.indent-rainbow",
+        "wix.vscode-import-cost",
+        "mkxml.vscode-filesize",
+        "christian-kohler.npm-intellisense",
+        "GitHub.vscode-pull-request-github",
+        "shyykoserhiy.git-autoconfig",
+        "actboy168.tasks",
+        "humao.rest-client",
+        "alefragnani.project-manager",
+        "mutantdino.resourcemonitor",
+        "ms-azuretools.vscode-docker",
+        "doppler.doppler-vscode",
+        "timonwong.shellcheck",
+        "foxundermoon.shell-format",
+        "mads-hartmann.bash-ide-vscode"
+      ]
+    }
+  }
+}

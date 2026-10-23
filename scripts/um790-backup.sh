@@ -199,7 +199,7 @@ phases:
   preflight  assert NAS reachable, repo openable, source sane; take the run lock
   config     reconstruct container configs from docker inspect, secrets redacted
   dumps      pg_dump the 4 Postgres DBs, VACUUM INTO the listed SQLite DBs
-  backup     restic backup /srv + staging
+  backup     restic backup /srv + staging, then read the snapshot back to prove it
   check      restic check (10% data read by default)
   snapshot   create a Btrfs share snapshot on the NAS (must precede prune)
   prune      forget --prune + sweep old snapshots; refuses without this run's snapshot
@@ -506,6 +506,92 @@ select_sweep_candidates() { # now_epoch retention_days
 }
 
 # ---------------------------------------------------------------------------
+# snapshot readback — prove the payload is IN the snapshot, not just on disk
+# ---------------------------------------------------------------------------
+# Every guard that existed before this one measured STAGING, and staging was being
+# excluded from the snapshot. So a run could produce ~18G of perfectly good dumps,
+# satisfy all of them, and still write a snapshot containing no database content at
+# all - which is exactly what happened, on both runs, before anyone noticed.
+#
+# The defect was not exotic and it was not a restic bug: `restic backup /srv "$STAGE"`
+# names staging as an EXPLICIT target, and restic silently drops an explicitly named
+# path that falls beneath an excluded ancestor. exclude.txt carried the ancestor.
+#
+# Hence a READBACK rather than another on-disk assertion: the on-disk checks were
+# the ones that were wrong, so repeating them in a new place would have reproduced
+# the blind spot with more confidence.
+#
+# It asserts in both directions, because each catches a different mistake:
+#   - the payload IS present (otherwise the backup is worthless), and
+#   - state/, cache/, ssh/ and staging/.tmp are NOT (otherwise an exclude that
+#     stopped matching silently starts putting run.lock, the restic cache and the
+#     NAS PRIVATE KEYS into snapshots, which is the one that really matters).
+#
+# Cost is one listing of the snapshot - on the order of 10^5 lines, a few seconds,
+# against a phase that just spent minutes uploading. Cheap enough to run every time,
+# and pointless to run any less often.
+assert_snapshot_contents() { # snapshot-id
+  local snap=$1
+  local -a got=()
+
+  # ONE pass over the listing, counted by awk, because a large snapshot has enough
+  # paths that walking it several times over an sftp transport is the dominant cost
+  # of the phase.
+  #
+  # THE COUNTS COME BACK ONE PER LINE, NOT SPACE-SEPARATED, and that is deliberate.
+  # IFS is $'\n\t' at the top of this file, so `read -r a b c` would not split on
+  # spaces at all - everything would land in the first variable and the comparisons
+  # below would compare the entire record against an integer. mapfile splits on
+  # newlines regardless of IFS, which removes the trap rather than restating it.
+  #
+  # index($0,x)==1 is a prefix test, not a substring search: a path merely
+  # MENTIONING "$BASE/ssh" deeper in the tree is not the ssh directory itself.
+  # Only the counts are emitted, so nothing sensitive is ever printed.
+  mapfile -t got < <(
+    restic_run ls "$snap" 2>/dev/null | awk -v s="$STAGE" -v b="$BASE" '
+      index($0, s "/pg/")     == 1 { pg++ }
+      index($0, s "/sqlite/") == 1 { sq++ }
+      index($0, s "/config/") == 1 { cf++ }
+      index($0, s "/config/containers.txt") == 1 { ct=1 }
+      index($0, s "/.tmp/")   == 1 { tp++ }
+      index($0, b "/state/")  == 1 { st++ }
+      index($0, b "/cache/")  == 1 { ca++ }
+      index($0, b "/ssh/")    == 1 { sh++ }
+      END {
+        printf "%d\n%d\n%d\n%d\n%d\n%d\n%d\n%d\n",
+               pg+0, sq+0, cf+0, ct+0, tp+0, st+0, ca+0, sh+0
+      }
+    '
+  )
+  (( ${#got[@]} == 8 )) \
+    || die "could not read snapshot ${snap} back (got ${#got[@]}/8 counters) — the snapshot exists but cannot be verified, which is not the same as verified"
+
+  local pg=${got[0]} sq=${got[1]} cf=${got[2]} ct=${got[3]}
+  local tp=${got[4]} st=${got[5]} ca=${got[6]} sh=${got[7]}
+
+  # --- the payload must be there -------------------------------------------
+  (( ct == 1 )) \
+    || die "snapshot ${snap} has no ${STAGE}/config/containers.txt — the config phase output did not reach the snapshot"
+  (( pg >= ${#PG_CONTAINERS[@]} )) \
+    || die "snapshot ${snap} has ${pg}/${#PG_CONTAINERS[@]} Postgres dumps — the dumps phase output did not reach the snapshot; check that deploy/exclude.txt still leaves staging/ reachable (an excluded ANCESTOR silently voids the explicit restic target)"
+  (( sq >= ${#SQLITE_DBS[@]} )) \
+    || die "snapshot ${snap} has ${sq}/${#SQLITE_DBS[@]} SQLite dumps — the dumps phase output did not reach the snapshot; same cause as the Postgres case above"
+  (( cf >= ${#PG_CONTAINERS[@]} + ${#SQLITE_DBS[@]} )) \
+    || die "snapshot ${snap} has only ${cf} files under ${STAGE}/config — the per-container inspect output is incomplete"
+
+  # --- the excludes must still be working ----------------------------------
+  # These are fatal rather than warnings: a snapshot that contains the restic/NAS
+  # private keys is a credential exposure on a NAS share, and "we will look at it
+  # later" is not a thing to leave in an automated run.
+  (( tp == 0 )) || die "snapshot ${snap} contains ${tp} path(s) under ${STAGE}/.tmp — dump scratch leaked in"
+  (( st == 0 )) || die "snapshot ${snap} contains ${st} path(s) under ${BASE}/state — runtime state (run.lock, *.epoch) leaked in"
+  (( ca == 0 )) || die "snapshot ${snap} contains ${ca} path(s) under ${BASE}/cache — restic's cache leaked in"
+  (( sh == 0 )) || die "snapshot ${snap} contains ${sh} path(s) under ${BASE}/ssh — SSH PRIVATE KEYS reached the snapshot; rotate them and fix deploy/exclude.txt"
+
+  log "snapshot ${snap} verified: ${pg} pg dump(s), ${sq} sqlite dump(s), ${cf} config file(s); no state/cache/ssh/.tmp"
+}
+
+# ---------------------------------------------------------------------------
 # preflight — fail before touching anything
 # ---------------------------------------------------------------------------
 do_preflight() {
@@ -555,6 +641,17 @@ do_preflight() {
   # Loaded from the copy just installed, so the guard below and the drift scan in
   # do_dumps measure the same set restic will.
   load_excludes
+
+  # THE EXCLUDE LIST MUST NOT COVER $BASE ITSELF. This is asserted rather than
+  # trusted, because the failure it causes is silent and total: restic drops an
+  # explicitly named target that sits under an excluded ancestor, so a single
+  # `/srv/.um790-backup` line voids `restic backup /srv "$STAGE"` and every phase
+  # still reports success. That exact line was in this file's history and cost two
+  # snapshots their entire database payload. Checking it here fails the run before
+  # anything is staged, instead of after ~15 minutes of dumping.
+  if grep -qxF "$BASE" "$EXCLUDES" 2>/dev/null; then
+    die "exclude list excludes ${BASE} itself — that silently voids the explicit 'restic backup /srv \${STAGE}' target. Exclude ${BASE}'s children instead (state, cache, ssh, staging/.tmp)"
+  fi
 
   # A lock from a crashed run must not block forever, but a lock that is hours old
   # is more likely a genuinely stuck run than a corpse.
@@ -785,6 +882,10 @@ do_dumps() {
   # That is why potato/n8n/vikunja had to be found by hand rather than by this
   # guard. The threshold exists to avoid failing on every trivial SQLite file in
   # the tree; it is not a statement that small databases are safe to copy live.
+  #
+  # "$BASE" is pruned explicitly, so the dumps this phase just staged are not
+  # scanned as undiscovered live databases - they are over 10M and would every one
+  # of them trip this guard otherwise.
   load_excludes
   (( ${#EXCLUDE_OR[@]} )) \
     || die "exclude list ${EXCLUDES} is missing or has no patterns — the SQLite drift scan would be exclude-blind, so it cannot tell a coverage hole from an excluded file; did preflight complete?"
@@ -867,13 +968,21 @@ do_backup() {
   if [[ $DRY_RUN == 1 ]]; then
     log "dry-run: would 'restic backup /srv ${STAGE}' with --exclude-file=${EXCLUDES}"
     log "dry-run: tags um790,run:<id>, --host um790, --retry-lock 5m"
+    log "dry-run: then would read the snapshot back and assert the staged payload is IN it"
     return 0
   fi
 
-  require_cmds restic
+  require_cmds restic jq
 
   # Refuse to record a snapshot that is missing the phase outputs. restic would
   # happily back up /srv alone and report success.
+  #
+  # THESE CHECKS READ STAGING ON DISK, and that is exactly why they could not
+  # detect the exclude defect that voided staging for two full runs: the files were
+  # present, correct and complete here, and absent from the snapshot. They are kept
+  # because they catch a different failure (a phase that did not run at all) early,
+  # but the claim they support is only "the phase ran", not "the data is backed up".
+  # assert_snapshot_contents below is what supports the latter.
   [[ -f $STATE/run.lock ]] || die "no run.lock — preflight did not run in this cycle"
   [[ -f $STAGE/config/containers.txt ]] || die "no container config staged — the config phase did not run"
   local pg sqlite
@@ -900,6 +1009,17 @@ do_backup() {
     --host um790 \
     --retry-lock 5m \
     || die "restic backup failed"
+
+  # PROVE IT LANDED. `restic backup` exiting 0 means it wrote a snapshot, not that
+  # the snapshot contains what the run was for. The tag is the handle: it is set on
+  # this snapshot only, so a stale snapshot from an earlier run can never satisfy
+  # the check.
+  local snap
+  snap=$(restic_run snapshots --tag "run:${run_id}" --json 2>/dev/null \
+           | jq -r 'if length > 0 then .[0].id else empty end' || true)
+  [[ -n $snap ]] \
+    || die "restic reported success but no snapshot carries tag run:${run_id} — cannot verify what was written"
+  assert_snapshot_contents "$snap"
 
   stamp > "$STATE/backup_done.epoch"
   log "backup ok (run ${run_id})"

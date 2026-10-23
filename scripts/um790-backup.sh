@@ -112,12 +112,12 @@ SNAPSHOT_MAX_AGE="${SNAPSHOT_MAX_AGE:-$((6 * 3600))}"
 # restated the policy would drift from it silently.
 RESTIC_KEEP_ARGS=(--keep-daily 7 --keep-weekly 4 --keep-monthly 6)
 
-# The size guard catches a WRONG MOUNT, not normal growth. It is measured with the
-# exclude list applied (see measure_source_gb), because the raw /srv total includes
-# ~19G that never enters the repository - /srv/backups, /srv/marketdata, the
-# Postgres clusters, caches and Dagu's own state. Guarding on the raw number meant
-# a correct source failed a limit derived from the payload size, so the limit had
-# to be set above a quantity it was never describing.
+# The size guard catches a WRONG MOUNT, not normal growth. It is measured with
+# the exclude list applied (see measure_source_gb), because the raw /srv total
+# includes ~19G that never enters the repository - /srv/backups, /srv/marketdata,
+# the Postgres clusters, caches and Dagu's own state. Guarding on the raw number
+# meant a correct source failed a limit derived from the payload size, so the
+# limit had to be set above a quantity it was never describing.
 #
 # 70G against a ~45G payload: generous enough that a few hundred GB of new data
 # does not page anyone, small enough that "the whole disk got mounted at /srv"
@@ -127,6 +127,19 @@ EXPECTED_MIN_CONTAINERS="${EXPECTED_MIN_CONTAINERS:-60}"
 CHECK_READ_SUBSET="${CHECK_READ_SUBSET:-10%}"    # weekly cadence, so 10% each run
 
 PG_CONTAINERS=(litellm-db mcphub-postgres miniflux-db miniflux-explore-db)
+# Every SQLite database that restic would otherwise copy as a RAW LIVE FILE.
+#
+# This list is the WAL-safety mechanism, not a curated selection: a database left
+# off it is not merely undumped, it is copied mid-transaction by `restic backup`
+# with its -wal sitting beside it, which is the corruption the `.backup` path
+# exists to prevent.
+#
+# THE DRIFT GUARD BELOW DOES NOT CLOSE THIS. It only trips on *.db over 10M, so
+# any live database under that size is invisible to it: neither dumped here nor
+# reported, just silently copied raw. potato, n8n and vikunja were all in that
+# blind spot (438K / 2.5M / 672K on 2026-10-22) and were added here for exactly
+# that reason. The 10M threshold is a guardrail against unseen NEW databases, not
+# a definition of which databases matter.
 SQLITE_DBS=(
   "/srv/msgvault/msgvault.db|msgvault"
   "/srv/docker/phoenix/data/phoenix.db|phoenix"
@@ -134,7 +147,16 @@ SQLITE_DBS=(
   "/srv/docker/pihole/config/pihole-FTL.db|pihole-ftl"
   "/srv/docker/mailroom/data/mailroom.db|mailroom"
   "/srv/reader/vg-books/reader.db|vg-books"
+  "/srv/docker/potato/project/project.sqlite|potato"
+  "/srv/docker/n8n/data/database.sqlite|n8n"
+  "/srv/docker/vikunja/db/vikunja.db|vikunja"
 )
+#
+# Deliberately NOT listed: /srv/docker/potato/project/datasets.sqlite. It does not
+# exist today, and an entry in this array is a hard failure when the path is
+# absent (see the `[[ -f $dbpath ]] || die` below). Potato creates it only in some
+# modes. Add it here the moment it appears on disk - it is live WAL state, so it is
+# the same class as project.sqlite, not a STATIC_SQLITE candidate.
 
 # SQLite files that ARE in the backup set but are NOT live databases: frozen
 # pre-migration copies sitting in a backups/ directory.
@@ -176,7 +198,7 @@ usage: um790-backup.sh <phase> [--dry-run]
 phases:
   preflight  assert NAS reachable, repo openable, source sane; take the run lock
   config     reconstruct container configs from docker inspect, secrets redacted
-  dumps      pg_dump the 4 Postgres DBs, VACUUM INTO the 6 SQLite DBs
+  dumps      pg_dump the 4 Postgres DBs, VACUUM INTO the listed SQLite DBs
   backup     restic backup /srv + staging
   check      restic check (10% data read by default)
   snapshot   create a Btrfs share snapshot on the NAS (must precede prune)
@@ -267,8 +289,8 @@ require_cmds() {
 
 # Join arguments with single spaces, whatever IFS happens to be.
 #
-# This exists because IFS is $'\n\t' at the top of this file, and `${arr[*]}`
-# expands with the FIRST character of IFS. That made the delete command below
+# This exists because IFS is $'\n\t' at the top of this file, and `${arr[*]}` expands
+# with the FIRST character of IFS. That made the delete command below
 # newline-separated. Log lines want spaces; remote shell commands need more than
 # just spaces (see snapshot_delete_cmd).
 join_space() { local IFS=' '; printf '%s' "$*"; }
@@ -329,6 +351,7 @@ snapshot_delete_cmd() { # share name...
 #   /*     a path prefix          -> -path (prunes the whole subtree)
 #   **/x   a basename at any depth -> -name
 #   x      a bare name            -> -name
+#
 # Restic's glob dialect is richer than this (character classes, ** inside a
 # segment). Anything it would match that find would not is a pattern whose purpose
 # is pruning a directory tree, which is the /* form - so a divergence here costs
@@ -616,7 +639,7 @@ do_config() {
 }
 
 # ---------------------------------------------------------------------------
-# dumps — 4 Postgres, 6 SQLite
+# dumps — 4 Postgres, one entry per SQLITE_DBS
 # ---------------------------------------------------------------------------
 do_dumps() {
   if [[ $DRY_RUN == 1 ]]; then
@@ -756,6 +779,12 @@ do_dumps() {
   # Without the exclude list this check is worse than useless, because every
   # excluded database would be reported, so a missing list is its own error rather
   # than a blind scan.
+  #
+  # THE SIZE THRESHOLD IS A BLIND SPOT, BY CONSTRUCTION. Only *.db > 10M is
+  # scanned, so a small live database is copied raw by restic and never reported.
+  # That is why potato/n8n/vikunja had to be found by hand rather than by this
+  # guard. The threshold exists to avoid failing on every trivial SQLite file in
+  # the tree; it is not a statement that small databases are safe to copy live.
   load_excludes
   (( ${#EXCLUDE_OR[@]} )) \
     || die "exclude list ${EXCLUDES} is missing or has no patterns — the SQLite drift scan would be exclude-blind, so it cannot tell a coverage hole from an excluded file; did preflight complete?"

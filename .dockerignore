@@ -13,3 +13,6 @@ __pycache__
 *.pyc
 *.pyo
 .DS_Store
+# Workspace tooling, not part of the image: the devcontainer's Dockerfile,
+# .zshrc/.p10k.zsh and setup scripts are host-side and only bloat `COPY . .`.
+.devcontainer

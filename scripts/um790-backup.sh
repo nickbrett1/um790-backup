@@ -146,11 +146,26 @@ SQLITE_DBS=(
   "/srv/docker/open-webui/data/webui.db|open-webui"
   "/srv/docker/pihole/config/pihole-FTL.db|pihole-ftl"
   "/srv/docker/mailroom/data/mailroom.db|mailroom"
+  "/srv/docker/mailroom/data/dagster/history/runs/index.db|dagster-history"
   "/srv/reader/vg-books/reader.db|vg-books"
   "/srv/docker/potato/project/project.sqlite|potato"
   "/srv/docker/n8n/data/database.sqlite|n8n"
   "/srv/docker/vikunja/db/vikunja.db|vikunja"
 )
+#
+# dagster-history was added on 2026-10-28 by the drift guard itself: Dagster's
+# run-storage index grew past the 10M threshold (10,608,640B) and the 03:30 run
+# died with "undiscovered SQLite >10M ... add it to SQLITE_DBS if it is live".
+# It is live - the dagster daemon and mailroom write run/asset history into it -
+# so dumping it is the correct arm, not the STATIC_SQLITE exemption and not an
+# exclude. Two consequences worth knowing before someone "fixes" the log:
+#   - it is WAL and, like mailroom.db, usually has no -wal at 03:30 because the
+#     writers closed cleanly, so it takes the staged-copy fallback and logs a
+#     WARNING every night. That WARNING is the designed path, not damage.
+#   - the ~400 per-run *.db event logs beside it stay OFF this list: each is far
+#     under the threshold, and dumping them individually would add ~400 copies
+#     for no consistency gain. They are restic-copied raw, which is the
+#     documented blind spot below, not an oversight.
 #
 # Deliberately NOT listed: /srv/docker/potato/project/datasets.sqlite. It does not
 # exist today, and an entry in this array is a hard failure when the path is
@@ -780,6 +795,19 @@ do_dumps() {
 
     tmp=$STAGE/.tmp/${name}.db
     out=$STAGE/sqlite/${name}.db
+
+    # IDEMPOTENT ACROSS RETRIES, and this is not tidiness. Dagu retries the failed
+    # STEP, not the run, so preflight - the phase that wipes staging - does not run
+    # again. A retry therefore starts with the previous attempt's partial output in
+    # place, and `VACUUM INTO` refuses an existing destination:
+    #     Error: stepping, output file already exists
+    # On 2026-10-28 the drift guard correctly failed the first attempt, and both
+    # automatic retries then died at msgvault with that error instead - a retry
+    # that cannot succeed, reporting a fault unrelated to the real one and
+    # burying it. These three files are this entry's own scratch and nothing
+    # else's, so clearing them is safe: staging is disposable by contract and
+    # preflight deletes all of it at the start of every cycle.
+    rm -f "$tmp" "$out" "$STAGE/.tmp/${name}.err"
 
     # PRIMARY PATH: .backup against the live database, through the read-only mount.
     #

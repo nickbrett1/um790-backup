@@ -114,10 +114,12 @@ RESTIC_KEEP_ARGS=(--keep-daily 14 --keep-weekly 4 --keep-monthly 6)
 
 # The size guard catches a WRONG MOUNT, not normal growth. It is measured with
 # the exclude list applied (see measure_source_gb), because the raw /srv total
-# includes ~19G that never enters the repository - /srv/backups, /srv/marketdata,
-# the Postgres clusters, caches and Dagu's own state. Guarding on the raw number
-# meant a correct source failed a limit derived from the payload size, so the
-# limit had to be set above a quantity it was never describing.
+# includes ~19G that never enters the repository - /srv/appdata/backups,
+# /srv/appdata/marketdata (the /srv/backups and /srv/marketdata trees until the
+# data move lands), the Postgres clusters, caches and Dagu's own state. Guarding
+# on the raw number meant a correct source failed a limit derived from the
+# payload size, so the limit had to be set above a quantity it was never
+# describing.
 #
 # 70G against a ~45G payload: generous enough that a few hundred GB of new data
 # does not page anyone, small enough that "the whole disk got mounted at /srv"
@@ -153,26 +155,35 @@ PG_CONTAINERS=(litellm-db mcphub-postgres miniflux-db miniflux-explore-db)
 # that reason. The 10M threshold is a guardrail against unseen NEW databases, not
 # a definition of which databases matter.
 SQLITE_DBS=(
-  "/srv/data/msgvault/msgvault.db|msgvault"
+  "/srv/appdata/msgvault/msgvault.db|msgvault"
   "/srv/docker/phoenix/data/phoenix.db|phoenix"
   "/srv/docker/open-webui/data/webui.db|open-webui"
   "/srv/docker/pihole/config/pihole-FTL.db|pihole-ftl"
   "/srv/docker/mailroom/data/mailroom.db|mailroom"
   "/srv/docker/mailroom/data/dagster/history/runs/index.db|dagster-history"
-  "/srv/data/reader/vg-books/reader.db|vg-books"
+  "/srv/appdata/reader/vg-books/reader.db|vg-books"
   "/srv/docker/potato/project/project.sqlite|potato"
   "/srv/docker/n8n/data/database.sqlite|n8n"
   "/srv/docker/vikunja/db/vikunja.db|vikunja"
 )
 #
-# msgvault and vg-books were REPOINTED to /srv/data/... (from /srv/msgvault and
-# /srv/reader) when the host's service data trees moved under /srv/data. The old
-# paths are not kept alongside the new ones: an entry here is a hard failure
-# when the file is absent (`[[ -f $dbpath ]] || die` below - "moved, renamed, or
-# wrong mount"), so a duplicated entry would do nothing but break the run the
-# moment the move lands. That is the stale-pattern trap, not a safety belt; the
-# belt for the transition lives in deploy/exclude.txt, where a dead line is
-# harmless.
+# msgvault and vg-books were REPOINTED to /srv/appdata/... (from /srv/msgvault
+# and /srv/reader) when the host's service data trees moved under /srv/appdata.
+# The old paths are not kept alongside the new ones: an entry here is a hard
+# failure when the file is absent (`[[ -f $dbpath ]] || die` below - "moved,
+# renamed, or wrong mount"), so a duplicated entry would do nothing but break the
+# run the moment the move lands. That is the stale-pattern trap, not a safety
+# belt; the belt for the transition lives in deploy/exclude.txt, where a dead
+# line is harmless.
+#
+# THE COST OF THAT CHOICE, stated plainly: between this image being pinned and
+# the host move completing, these two entries name a path that does not exist
+# yet, while the old ones still hold the data. The dumps phase therefore FAILS
+# LOUDLY at the first entry instead of quietly dumping the old location - and if
+# it somehow got past that, the drift guard would fire on the now-unlisted old
+# files (/srv/msgvault/msgvault.db ~8.2G, /srv/reader/vg-books/reader.db ~108M).
+# So the pin and the host move belong in the same sitting, and a run landing in
+# the gap fails rather than producing a snapshot that silently lacks a database.
 #
 # dagster-history was added on 2026-10-28 by the drift guard itself: Dagster's
 # run-storage index grew past the 10M threshold (10,608,640B) and the 03:30 run

@@ -154,9 +154,10 @@ this design declines.
 
 The source-size guard, in whole gigabytes, measured on `/srv` **with the exclude
 list applied**. It describes the backup set, not the disk: the raw `/srv` total
-is roughly 19G larger than the payload (`/srv/backups`, `/srv/marketdata`, the
-Postgres clusters, caches, Dagu's own state), and counting that is why a correct
-source could fail this check.
+is roughly 19G larger than the payload (`/srv/appdata/backups`,
+`/srv/appdata/marketdata` — the `/srv/backups` and `/srv/marketdata` trees until
+the data move lands — the Postgres clusters, caches, Dagu's own state), and
+counting that is why a correct source could fail this check.
 
 It exists to catch a **wrong mount**, not normal growth — a `/srv` that suddenly
 measures hundreds of gigabytes is a disk mounted in the wrong place. The default

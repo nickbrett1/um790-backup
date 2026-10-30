@@ -126,6 +126,18 @@ MAX_SOURCE_GB="${MAX_SOURCE_GB:-70}"
 EXPECTED_MIN_CONTAINERS="${EXPECTED_MIN_CONTAINERS:-60}"
 CHECK_READ_SUBSET="${CHECK_READ_SUBSET:-10%}"    # weekly cadence, so 10% each run
 
+# A DEADLINE ON THE SQLITE PRIMARY PATH, because sqlite3's `.backup` has none of
+# its own: when the live database is locked, or keeps changing under the copy, the
+# CLI sleeps 250ms and retries forever. Measured on 2026-10-30 — mailroom's
+# `.backup` sat for 2h17m before failing, turning a 16m run into 2h33m, while the
+# staged-copy fallback dumped the same 275MB database in about a second.
+#
+# 900s is generous for a database that normally dumps in under a second, and small
+# against a multi-hour stall. Expiry takes the SAME branch as any other `.backup`
+# failure — the staged copy — so this changes WHEN the fallback happens, never
+# whether the dump is made. It cannot turn a good dump into a missing one.
+SQLITE_BACKUP_TIMEOUT="${SQLITE_BACKUP_TIMEOUT:-900}"
+
 PG_CONTAINERS=(litellm-db mcphub-postgres miniflux-db miniflux-explore-db)
 # Every SQLite database that restic would otherwise copy as a RAW LIVE FILE.
 #
@@ -204,6 +216,24 @@ PHASE=""
 log()  { printf '%s [%s] %s\n' "$(date -u +%FT%TZ)" "${PHASE:-validate}" "$*" >&2; }
 die()  { log "FATAL: $*"; exit 1; }
 stamp() { date -u +%s; }
+
+# Seconds -> something a person can read at a glance: 9180 -> "2h33m", 210 -> "3m",
+# 42 -> "42s". The raw second count is still what last_success.json carries and
+# what the log line prints; this is display only.
+#
+# Minutes are TRUNCATED, not rounded up, so the number never overstates a run that
+# finished just under the next minute. A sub-minute run keeps its seconds rather
+# than collapsing to "0m", which would read like a failure to measure.
+human_duration() { # seconds
+  local s=$1
+  if (( s >= 3600 )); then
+    printf '%dh%02dm\n' $(( s / 3600 )) $(( (s % 3600) / 60 ))
+  elif (( s >= 60 )); then
+    printf '%dm\n' $(( s / 60 ))
+  else
+    printf '%ds\n' "$s"
+  fi
+}
 
 usage() {
   cat >&2 <<'EOF'
@@ -762,8 +792,10 @@ do_dumps() {
     return 0
   fi
 
-  require_cmds docker sqlite3 find
+  require_cmds docker sqlite3 find timeout
   [[ -d $STAGE/pg ]] || die "${STAGE} missing — the preflight phase did not run in this cycle"
+  [[ $SQLITE_BACKUP_TIMEOUT =~ ^[0-9]+$ ]] \
+    || die "SQLITE_BACKUP_TIMEOUT='${SQLITE_BACKUP_TIMEOUT}' is not a whole number of seconds"
 
   local c out sz user db
   for c in "${PG_CONTAINERS[@]}"; do
@@ -787,7 +819,7 @@ do_dumps() {
     log "pg ${c} -> ${sz}B"
   done
 
-  local entry name tmp dbpath
+  local entry name tmp dbpath started elapsed rc
   for entry in "${SQLITE_DBS[@]}"; do
     dbpath=${entry%%|*}
     name=${entry##*|}
@@ -837,9 +869,19 @@ do_dumps() {
     # on the last clean close, so at 03:00 there is nothing to read. The other five
     # keep a persistent connection, keep a live -wal, and never reach this branch -
     # which is why their success is not evidence that mailroom is fine.
-    if sqlite3 "$dbpath" ".backup '${tmp}'" 2>"$STAGE/.tmp/${name}.err"; then
+    started=$(stamp)
+    if timeout "$SQLITE_BACKUP_TIMEOUT" sqlite3 "$dbpath" ".backup '${tmp}'" 2>"$STAGE/.tmp/${name}.err"; then
       rm -f "$STAGE/.tmp/${name}.err"
     else
+      rc=$?
+      # 124 is `timeout`'s own status, not SQLite's: the copy was still making
+      # progress (or still waiting on a lock) when the deadline hit. Named
+      # separately because "failed" would read as a broken database when the
+      # truth is "this database would not hold still long enough for the online
+      # copy" - and the fallback below handles exactly that case.
+      if (( rc == 124 )); then
+        log "WARNING: ${name}: .backup hit the ${SQLITE_BACKUP_TIMEOUT}s deadline against the live database (locked or changing); using the staged copy"
+      fi
       # FALLBACK: copy main + -wal into writable staging, then dump the copy.
       #
       # WHY THE -wal COMES TOO. Copying the main file alone would look like a fix
@@ -866,6 +908,16 @@ do_dumps() {
       # The mitigations are the integrity_check below and the fact that this branch
       # is only reached for a database that was unopenable read-only, which in
       # practice means no -wal, which means no checkpoint in flight.
+      #
+      # THAT MITIGATION IS WEAKER THAN IT WAS, and the deadline above is why. When
+      # this branch was only reachable through CANTOPEN, "no -wal at dump time" was
+      # the usual state and no checkpoint could be in flight. A timeout can also
+      # land here WITH a live -wal - i.e. with a writer attached and a checkpoint
+      # possible - so the torn-copy risk is now reachable too, not just theoretical.
+      # It is still the better failure: integrity_check runs on the dumped copy
+      # below, and a torn copy that passes it was indistinguishable from a good one
+      # under the old code anyway. What the deadline buys is bounded time, and what
+      # it costs is stated here rather than discovered later.
       local cpdir=$STAGE/.tmp/${name}.src
       rm -rf "$cpdir"
       install -d -m 0700 "$cpdir"
@@ -878,8 +930,8 @@ do_dumps() {
       else
         log "WARNING: ${name}: .backup failed and no -wal exists at dump time; falling back to a staged copy of the quiescent main file"
       fi
-      sqlite3 "$cpdir/${name}.db" ".backup '${tmp}'" \
-        || die "${name}: .backup failed on the staged copy as well (SQLITE_CANTOPEN=14 is not a lock; check the mount and the -wal)"
+      timeout "$SQLITE_BACKUP_TIMEOUT" sqlite3 "$cpdir/${name}.db" ".backup '${tmp}'" \
+        || { rc=$?; die "${name}: .backup failed on the staged copy as well (exit ${rc}: 124 = deadline, 14 = CANTOPEN, 5 = locked; check the mount and the -wal)"; }
       rm -rf "$cpdir"
       rm -f "$STAGE/.tmp/${name}.err"
       log "${name}: staged-copy fallback succeeded"
@@ -890,7 +942,12 @@ do_dumps() {
       || die "${name}: dumped copy fails integrity_check"
     sz=$(stat -c %s "$out")
     (( sz > 4096 )) || die "${name}: dumped copy implausibly small (${sz}B)"
-    log "sqlite ${name} -> ${sz}B"
+    elapsed=$(( $(stamp) - started ))
+    # The duration is APPENDED to the line, not substituted for anything: a dump
+    # that took 2h17m and one that took 1s used to look identical in this log,
+    # which is why a 2h stall had to be reconstructed from timestamps on two
+    # neighbouring lines instead of read off the line that reports the work.
+    log "sqlite ${name} -> ${sz}B ($(human_duration "$elapsed"))"
     rm -f "$tmp"
   done
 
@@ -1341,11 +1398,19 @@ EOF
   # .buildkite/pipeline.yml returns no matches, and the smoke gate's --dry-run
   # returns from this function before any of it is built.
   #
+  # The DURATION got the same treatment: it used to end "..., 9180s", and 9180 is
+  # not a number anyone converts to 2h33m while half-awake. It now renders through
+  # human_duration as "2h33m" (or "35m", or "42s" for a run under a minute). This
+  # is the one field whose value is LOST in the swap, so it is worth stating where
+  # it survives: `duration_sec` in last_success.json and the log line below both
+  # still carry exact seconds - the log line is unchanged on purpose, because a log
+  # is read for precision and a notification is read for shape.
+  #
   # Order matters and is unchanged: last_success.json is renamed into place and the
   # lock released BEFORE the notification is attempted, so a notifier outage can
   # only cost the message - it can never withhold the heartbeat or block the next
   # run on a stale lock.
-  notify default "um790 backup OK" "${containers} containers, ${pg} pg + ${sqlite} sqlite dumps, $(numfmt --to=iec "$bytes"), ${duration}s"
+  notify default "um790 backup OK" "${containers} containers, ${pg} pg + ${sqlite} sqlite dumps, $(numfmt --to=iec "$bytes"), $(human_duration "$duration")"
   log "status written (${snapshots} snapshots, ${containers} containers, ${pg} pg + ${sqlite} sqlite dumps, ${bytes}B, ${duration}s)"
 }
 

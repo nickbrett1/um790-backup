@@ -43,91 +43,83 @@
 /srv/.um790-backup/ssh
 /srv/.um790-backup/staging/.tmp
 
-# /srv/backups — this host's OWN backup output, deliberately PART-covered.
+# /srv/appdata/backups — this host's OWN backup output, deliberately PART-covered.
 #
 # The blanket `/srv/backups` line that used to live here was justified as
 # "other machines' data: large, and not ours to restore". That was wrong on the
-# facts. The directory has exactly three children and every one of them is this
-# host's own service data. Verified 2026-10-22: no bind mounts, no nested
-# mounts, no symlink escaping the tree (the one symlink is
-# obsidian-vault/latest.tar.gz -> a file in the same directory, relative).
+# facts: every child of that directory was this host's own service data.
+# Verified 2026-10-22: no bind mounts, no nested mounts, no symlink escaping the
+# tree (the one symlink is obsidian-vault/latest.tar.gz -> a file in the same
+# directory, relative).
 #
-#   potato/          1.6M   potato-backup DAG output: project.sqlite + state tar
-#   obsidian-vault/  20M    obsidian-vault-backup DAG output: nightly tarball
-#   msgvault/        5.8G   msgvault-native repo, 73 snapshots to 2026-08-16
+# The tree MOVED to /srv/appdata/backups on 2026-10-30 (reader, msgvault,
+# marketdata, data-scout, backups -> /srv/appdata/<name>), so the patterns here
+# name the new parent. As of that move it holds:
 #
-# The first two are now INCLUDED. They are small, clean (no special files, no
+#   obsidian-vault/  41M   obsidian-vault-backup DAG output, nightly 04:30
+#   um790-backup-manual-20261023T1045Z/  32K  stale run logs, awaiting deletion
+#
+# obsidian-vault/ is INCLUDED. It is small, clean (no special files, no
 # hardlinks, not sparse) and append-only at one file per day, so restic dedup
-# stores roughly 2.6M/night. Excluding them meant those two DAGs were writing
-# backups onto the same NVMe partition they exist to protect: /srv/backups and
-# /srv are one ext4 filesystem on /dev/nvme0n1p2 (same st_dev 66306), and
-# nothing on this host moves the directory off it - no rsync/rclone/scp/
-# syncthing/btrfs-send in the DAG repo or /srv/stack, empty user crontab, stock
-# /etc/cron.d, all stock systemd timers, no NFS/SMB export.
+# stores roughly 2.6M/night. Excluding it meant that DAG wrote its backups onto
+# the same NVMe partition they exist to protect.
 #
-# msgvault/ by contrast stays EXCLUDED, and is slated for deletion once the
-# msgvault-backup DAG is disabled:
-#   - its subject, /srv/msgvault/msgvault.db, is dumped by the dumps phase AND
-#     copied raw by the /srv walk, so this repo is a third copy of the same data;
-#   - nothing prunes it. 73 .mvmanifest snapshots back to repo creation
-#     (2026-08-16), growing without bound, 5.8G today;
-#   - config.toml says encryption = "none", so it is an unencrypted plaintext
-#     second copy of the entire mail archive sitting on a share.
-# ORDER MATTERS on removal: disable the DAG BEFORE deleting the directory, or
-# its next 04:00 tick recreates it. compose mounts /srv/backups/msgvault:/backup
-# and the DAG runs `msgvault backup create --repo /backup`.
+# TWO CHILDREN ARE GONE, and their exclude lines went with them - a pattern that
+# matches nothing protects nothing:
 #
-# DONE 2026-10-30: the store was DELETED on the host (5.8G, 73 snapshots). Its
-# own repository had been frozen since 2026-10-22 and is superseded by the
-# msgvault.db dump the dumps phase already produces, so nothing was lost with
-# it. The /srv/appdata/backups/msgvault mirror line has been removed with the
-# store. The /srv/backups/msgvault line below is now a dead pattern that matches
-# nothing - inert, but it belongs to the transitional cleanup (see the
-# TRANSITIONAL block below), not to this commit.
+#   potato/     deleted 2026-10-30 (1.6M of potato-backup DAG output)
+#   msgvault/   deleted 2026-10-30 (5.8G native repo, 73 snapshots from
+#               2026-08-16, frozen since 2026-10-22). It was not the only copy:
+#               /srv/appdata/msgvault/msgvault.db is dumped by the dumps phase
+#               AND copied raw by the /srv walk, so this repo was a third copy -
+#               unencrypted (encryption = "none") and pruned by nothing. Its own
+#               mount was removed from compose at the same time.
 #
 # WHY THE CHILDREN ARE NAMED RATHER THAN THE PARENT PLUS A NEGATION: restic
-# 0.18.1 has no negation syntax at all. A `!/srv/backups/something` line is
-# treated as a literal path pattern starting with '!', matches nothing, and
+# 0.18.1 has no negation syntax at all. A `!/srv/appdata/backups/something` line
+# is treated as a literal path pattern starting with '!', matches nothing, and
 # produces no warning and no error - verified empirically against the pinned
 # binary, not inferred from docs. The only way to include a subdirectory of an
 # excluded parent is to narrow or drop the parent exclusion, which is what this
 # block does. (The `restic help backup` exclude surface offers only
 # --exclude, --iexclude, their -file forms, --exclude-if-present,
 # --exclude-caches and --exclude-larger-than.)
-/srv/backups/msgvault
+#
+# NOTE: nothing here is excluded under /srv/appdata/backups today. The block is
+# kept because it is the written record of why the parent is not excluded, and
+# because the next backup output to land there will need the same reasoning.
 
-# TRANSITIONAL: the /srv/appdata mirror lines, added BEFORE the host move.
+# MIGRATION COMPLETE 2026-10-30 — the /srv -> /srv/appdata transitional belt is
+# REMOVED, and this is the commit that removes it.
 #
-# The service data trees are being relocated from /srv/<name> to
-# /srv/appdata/<name> (reader, msgvault, marketdata, data-scout, backups), so
-# that /srv/docker holds only stack definitions and /srv/appdata only persistent
-# state. The /srv/appdata lines below are added while the /srv/<name> originals
-# they mirror are STILL PRESENT: this image is built and pinned BEFORE the data
-# moves, so for a while either path may be the live one. The originals are
-# deleted in a FOLLOW-UP commit once the move is verified on the host.
+# The previous revision carried both sets of patterns on purpose: the image is
+# built and pinned BEFORE the host move, so for a window either path could be the
+# live one, and a window in which neither is excluded does not fail loudly - the
+# nightly run just backs up ~15G it exists to skip, silently and expensively. The
+# /srv/<name> originals and the appdata mirrors of them have now been verified
+# absent on the host, so they are gone from this file:
 #
-# Both sets must be here in the meantime, on purpose. A window in which neither
-# the old nor the new path is excluded does not fail loudly: the nightly run just
-# backs up ~15G it exists to skip, silently and expensively. Keeping both costs
-# three dead pattern lines that match nothing - and a pattern that matches
-# nothing is inert, which is exactly why the transition belt belongs HERE and not
-# in SQLITE_DBS, where an entry naming a path that is not there yet is a hard
-# failure (see the note beside that array).
+#   /srv/backups/msgvault         gone (store deleted; see the block above)
+#   /srv/marketdata               gone (dissolved - see below)
+#   /srv/appdata/marketdata       gone (dissolved - see below)
+#   /srv/msgvault/backup-cache    gone (tree is now /srv/appdata/msgvault)
 #
-# TO REMOVE after the move: the /srv/<name> originals (/srv/backups/msgvault,
-# /srv/marketdata, /srv/msgvault/backup-cache) and this comment block. NOT the
-# /srv/datasets* lines further down - that store is not moving.
-#
-# The pair for `backups` is NO LONGER here: /srv/appdata/backups/msgvault was
-# removed on 2026-10-30 because the store itself was deleted on the host (see
-# the msgvault block ABOVE). Excluding a path that does not exist protects
-# nothing, so the mirror line went with it. The remaining pairs stay exactly as
-# they were - they are the follow-up's to remove, not this commit's.
+# An exclude that matches nothing is inert HERE but must never be added to
+# SQLITE_DBS, where an entry naming an absent path is a HARD FAILURE - that is
+# why the transition belt belonged in this file and not in that array.
 
-# Other machines' data: large, and not ours to restore.
-/srv/marketdata
-# transitional /srv/appdata mirror - see the block above.
-/srv/appdata/marketdata
+# /srv/appdata/marketdata NO LONGER EXISTS, and its two halves went to two
+# different places on 2026-10-30. The name was a NAS-era container name; the move
+# finally showed it was holding two unlike things:
+#
+#   13G Databento payload  -> /srv/datasets/databento  (a DATASET: DVC, btrfs
+#                             store, backed up by default - see below)
+#   264K request book      -> /srv/appdata/data-sourcing-agent/requests
+#                             (an AGENT's state: git-tracked, pushed to
+#                             github.com/nickbrett1/marketdata-requests)
+#
+# Neither is excluded, and both are now in the backup. Do not recreate
+# /srv/appdata/marketdata as an umbrella for either one; the split is the point.
 
 # The data-scout dataset store: a SECOND FILESYSTEM mounted over this tree.
 #
@@ -148,7 +140,7 @@
 # possible direction: it left the most valuable data on the host UNPROTECTED
 # unless someone noticed the glob and acted on it, and a glob cannot be
 # un-applied to one dataset (restic 0.18.1 has no negation - see the msgvault
-# block above), so "carving one dataset back out" was not expressible here
+# history above), so "carving one dataset back out" was not expressible here
 # either. Policy inverted on 2026-10-30: payloads in, exclusion explicit.
 #
 # EXCLUSION IS NOW EXPLICIT AND PER-DATASET. A dataset may be excluded only by
@@ -162,8 +154,21 @@
 # copy of itself; its data/ must stay in the backup. Do not reintroduce a glob
 # or a wildcard here: the whole point of naming one path is that every other
 # dataset - and every dataset imported later - inherits protection without an
-# edit. (/srv/datasets/databento, the 13G first import, has no line here and is
-# therefore protected in full, its DVC-managed data/ included.)
+# edit.
+#
+# THE FIRST REAL DATASET IS NOW THERE: /srv/datasets/databento, 13G - 10 XNAS +
+# 1 MEMX MBO batches, raw plus 7 converted Parquet batches, imported 2026-10-30
+# from the old /srv/appdata/marketdata/backup tree and verified byte-exact
+# before the source was deleted. It has NO LINE HERE and is therefore protected
+# in full, its DVC-managed data/ included. Two structural facts about it matter
+# to a future exclude:
+#
+#   - its payload lives under data/, and Databento's condition.json,
+#     manifest.json and metadata.json were lifted OUT of the batch directories
+#     into a sibling receipt/ tree precisely so that an exclude matching data/
+#     cannot lose the provenance of the payload it removes;
+#   - data/parquet/*.parquet are relative SYMLINKS into the batch directories
+#     (a flat index for tools that glob one directory), not extra copies.
 #
 # The REST of each dataset directory - README, dvc.yaml, findings and the
 # per-dataset git repository - was never excluded: small, and not regenerable
@@ -189,8 +194,6 @@
 /srv/docker/openclaw/config/tmp
 /srv/docker/openclaw/config/cache
 /srv/docker/netdata/cache
-/srv/msgvault/backup-cache
-# transitional /srv/appdata mirror - see the block above the /srv/backups/msgvault line.
 /srv/appdata/msgvault/backup-cache
 /srv/docker/pihole/config/listsCache
 

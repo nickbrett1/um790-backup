@@ -311,8 +311,14 @@ backup tells you how the container was wired, not what its tokens were.
 
 - Secrets. They live in Doppler and are backed up by Doppler; rotate them if a
   device holding them is lost.
-- Data on other machines, and `/srv/backups`, `/srv/marketdata` (excluded as
-  another machine's data).
+- Nothing on `/srv` that this host owns is deliberately left out, with one
+  exception: `/srv/datasets-cache`, which holds only reflink copies of payload
+  that is itself in the backup. The 2026-10-30 move under `/srv/appdata`
+  retired the older exclusions: `/srv/marketdata`'s payload is now the dataset
+  `/srv/datasets/databento` (in the backup, its `receipt/` provenance included)
+  and its request book is now `/srv/appdata/data-sourcing-agent/requests`
+  (in the backup). `/srv/backups` itself no longer exists - its obsidian-vault
+  output moved to `/srv/appdata/backups` and is copied too.
 - Anything outside `/srv` on um790, including `/etc` and the Docker daemon
   configuration. Container definitions are covered by `config/`; the host's own
   configuration is not.

@@ -177,13 +177,21 @@ SQLITE_DBS=(
 # line is harmless.
 #
 # THE COST OF THAT CHOICE, stated plainly: between this image being pinned and
-# the host move completing, these two entries name a path that does not exist
-# yet, while the old ones still hold the data. The dumps phase therefore FAILS
+# the host move completing, these two entries named a path that did not exist
+# yet, while the old ones still held the data. The dumps phase therefore FAILED
 # LOUDLY at the first entry instead of quietly dumping the old location - and if
 # it somehow got past that, the drift guard would fire on the now-unlisted old
 # files (/srv/msgvault/msgvault.db ~8.2G, /srv/reader/vg-books/reader.db ~108M).
-# So the pin and the host move belong in the same sitting, and a run landing in
-# the gap fails rather than producing a snapshot that silently lacks a database.
+# So the pin and the host move belonged in the same sitting, and a run landing in
+# the gap failed rather than producing a snapshot that silently lacks a database.
+#
+# The move COMPLETED and was verified on the host on 2026-10-30: both entries
+# above name live files, no /srv/<name> original remains, and the transitional
+# mirror lines in deploy/exclude.txt were removed with it. That is the shape to
+# keep. An entry here is a promise that the file is at that path on every host
+# this image runs against, checked at run time - so it can never be carried
+# "just in case" the way an exclude line can, and a path in transition belongs in
+# that file, never in this array.
 #
 # dagster-history was added on 2026-10-28 by the drift guard itself: Dagster's
 # run-storage index grew past the 10M threshold (10,608,640B) and the 03:30 run

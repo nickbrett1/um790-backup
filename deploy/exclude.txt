@@ -120,6 +120,11 @@
 #
 # Neither is excluded, and both are now in the backup. Do not recreate
 # /srv/appdata/marketdata as an umbrella for either one; the split is the point.
+#
+# /srv/appdata/data-sourcing-agent/state is new on the same day (the agent's own
+# bookkeeping) and is protected by the same absence. Neither requests/ nor state/
+# may ever acquire a line here: requests/ is the only record of what was ordered,
+# so an exclusion covering the agent's directory would take it along silently.
 
 # The data-scout dataset store: a SECOND FILESYSTEM mounted over this tree.
 #
@@ -179,6 +184,15 @@
 # reflink of something under a dataset's data/, which is now itself in the
 # backup. A snapshot of the cache adds bytes and no recoverable information -
 # the payload beside it already holds every one of them.
+#
+# It is also EMPTY today (verified 2026-10-30: du reports 0 and find counts no
+# entries below it, the databento import having moved the payload into the
+# dataset), so this line currently removes nothing from the backup. It is kept
+# rather than deleted because the cache is where the NEXT import's objects land,
+# and a line that has to be re-added under time pressure during an import is a
+# line that gets forgotten. "Matches nothing today" is not a reason to drop it
+# here - unlike the transitional patterns retired above, which named paths that
+# no longer exist and will not come back.
 /srv/datasets-cache
 
 # Postgres data directories. The database contents are covered by pg_dump in the

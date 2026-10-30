@@ -154,15 +154,18 @@ this design declines.
 
 The source-size guard, in whole gigabytes, measured on `/srv` **with the exclude
 list applied**. It describes the backup set, not the disk: the raw `/srv` total
-is roughly 19G larger than the payload (`/srv/appdata/backups`,
-`/srv/appdata/marketdata` — the `/srv/backups` and `/srv/marketdata` trees until
-the data move lands — the Postgres clusters, caches, Dagu's own state), and
-counting that is why a correct source could fail this check.
+is larger than the payload, and counting the difference is why a correct source
+once failed this check. What the exclusion removes today is small — the three
+Postgres clusters, `/srv/.um790-backup`, and `/srv/datasets-cache` (which is
+empty). Everything else is in the set, the 13G `/srv/datasets/databento`
+included.
 
 It exists to catch a **wrong mount**, not normal growth — a `/srv` that suddenly
 measures hundreds of gigabytes is a disk mounted in the wrong place. The default
-(70 against ~45G of payload) is deliberately loose for that reason. Raise it when
-the data genuinely grows; do not raise it to make a mount problem go away.
+(70 against roughly 30–45G of payload, measured 2026-10-30: the figure depends on
+whether `/srv/datasets`' separate filesystem is crossed) is deliberately loose for
+that reason. Raise it when the data genuinely grows; do not raise it to make a
+mount problem go away.
 
 ## 4. Promotion, pinning and rollback
 

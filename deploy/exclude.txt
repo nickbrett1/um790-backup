@@ -77,6 +77,14 @@
 # its next 04:00 tick recreates it. compose mounts /srv/backups/msgvault:/backup
 # and the DAG runs `msgvault backup create --repo /backup`.
 #
+# DONE 2026-10-30: the store was DELETED on the host (5.8G, 73 snapshots). Its
+# own repository had been frozen since 2026-10-22 and is superseded by the
+# msgvault.db dump the dumps phase already produces, so nothing was lost with
+# it. The /srv/appdata/backups/msgvault mirror line has been removed with the
+# store. The /srv/backups/msgvault line below is now a dead pattern that matches
+# nothing - inert, but it belongs to the transitional cleanup (see the
+# TRANSITIONAL block below), not to this commit.
+#
 # WHY THE CHILDREN ARE NAMED RATHER THAN THE PARENT PLUS A NEGATION: restic
 # 0.18.1 has no negation syntax at all. A `!/srv/backups/something` line is
 # treated as a literal path pattern starting with '!', matches nothing, and
@@ -109,7 +117,12 @@
 # TO REMOVE after the move: the /srv/<name> originals (/srv/backups/msgvault,
 # /srv/marketdata, /srv/msgvault/backup-cache) and this comment block. NOT the
 # /srv/datasets* lines further down - that store is not moving.
-/srv/appdata/backups/msgvault
+#
+# The pair for `backups` is NO LONGER here: /srv/appdata/backups/msgvault was
+# removed on 2026-10-30 because the store itself was deleted on the host (see
+# the msgvault block ABOVE). Excluding a path that does not exist protects
+# nothing, so the mirror line went with it. The remaining pairs stay exactly as
+# they were - they are the follow-up's to remove, not this commit's.
 
 # Other machines' data: large, and not ours to restore.
 /srv/marketdata
@@ -122,35 +135,46 @@
 # one btrfs filesystem on a second NVMe - UUID
 # 21d8744e-1425-4d9e-94ea-3361b9139a9c - mounted over /srv's ext4 tree. restic
 # walks into mounts (this job passes no --one-file-system, and that default is
-# load-bearing: it is also why bind-mounted service data is visible), so without
-# the two lines below a single nightly run copies the entire store to the NAS.
+# load-bearing: it is also why bind-mounted service data is visible), so the
+# store falls into the snapshot by the ordinary /srv walk, and only a line in
+# this file can take a part of it back out.
 #
-#   /srv/datasets-cache   pure reflink-shared object storage: every byte in it
-#                         is a reflink of something under a dataset's data/, so
-#                         a snapshot of the cache alone restores nothing that
-#                         could not be rebuilt from the payload. Never worth a
-#                         byte.
-#   /srv/datasets/*/data  the payload half of each dataset - the large,
-#                         re-obtainable part.
+# DATASET PAYLOADS ARE BACKED UP BY DEFAULT. For a backup system the default has
+# to be "protected": an absent line here means the data is in the snapshot.
+# Each dataset's data/ is therefore included with no entry in this file at all.
 #
-# The REST of each dataset directory is deliberately NOT excluded: README,
-# dvc.yaml, findings and the per-dataset git repository. They are small and
-# cannot be regenerated from anywhere, so they are the part a restore needs.
+# This block used to carry `/srv/datasets/*/data`, justified as "the payload
+# half - the large, re-obtainable part". That inverted the default in the worst
+# possible direction: it left the most valuable data on the host UNPROTECTED
+# unless someone noticed the glob and acted on it, and a glob cannot be
+# un-applied to one dataset (restic 0.18.1 has no negation - see the msgvault
+# block above), so "carving one dataset back out" was not expressible here
+# either. Policy inverted on 2026-10-30: payloads in, exclusion explicit.
 #
-# `*` does not cross a '/' (restic matches per path component), so the glob
-# covers exactly one level: the data/ of a dataset sitting directly under
-# /srv/datasets. It matches NOTHING today - no dataset has been imported yet -
-# which is why it is safe to land before the first import.
+# EXCLUSION IS NOW EXPLICIT AND PER-DATASET. A dataset may be excluded only by
+# naming its exact path in this file, with the reason on the same line, and only
+# when its own README declares `reproducible: yes` - i.e. its payload can be
+# regenerated from upstream:
 #
-# A dataset whose README says `reproducible: no` is the only copy of itself, so
-# its data must stay in the backup. NOTE that removing "its exclusion" is not
-# something this file can express while the glob above stands: a line cannot
-# carve one dataset back out of a pattern that matches it (restic 0.18.1 has no
-# negation - see the msgvault block above). Carving one out means narrowing the
-# glob to the reproducible datasets by name. Whoever imports such a dataset owns
-# that edit; do not assume the glob has it covered.
+#   /srv/datasets/<name>/data   # reproducible: yes, rebuilt by `dvc repro`
+#
+# A dataset whose README says `reproducible: no`, or says nothing, is the only
+# copy of itself; its data/ must stay in the backup. Do not reintroduce a glob
+# or a wildcard here: the whole point of naming one path is that every other
+# dataset - and every dataset imported later - inherits protection without an
+# edit. (/srv/datasets/databento, the 13G first import, has no line here and is
+# therefore protected in full, its DVC-managed data/ included.)
+#
+# The REST of each dataset directory - README, dvc.yaml, findings and the
+# per-dataset git repository - was never excluded: small, and not regenerable
+# from anywhere. Together with data/ they are what a restore needs.
+#
+# /srv/datasets-cache STAYS EXCLUDED, and that is a technical fact rather than
+# policy: it is pure reflink-shared object storage, so every byte in it is a
+# reflink of something under a dataset's data/, which is now itself in the
+# backup. A snapshot of the cache adds bytes and no recoverable information -
+# the payload beside it already holds every one of them.
 /srv/datasets-cache
-/srv/datasets/*/data
 
 # Postgres data directories. The database contents are covered by pg_dump in the
 # dumps phase; copying the raw cluster would be inconsistent and far larger.

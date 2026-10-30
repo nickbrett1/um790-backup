@@ -88,8 +88,29 @@
 # --exclude-caches and --exclude-larger-than.)
 /srv/backups/msgvault
 
+# TRANSITIONAL: the /srv/data mirror lines, added BEFORE the host move.
+#
+# The service data trees are being relocated from /srv/<name> to /srv/data/<name>
+# (reader, msgvault, marketdata, data-scout, backups). The /srv/data lines below
+# are added while the /srv/<name> originals they mirror are STILL PRESENT, and
+# the originals are to be deleted in a FOLLOW-UP commit once the move is
+# verified on the host.
+#
+# Both sets must be here in the meantime, on purpose. The image is pinned before
+# the data actually moves, so for a while either path may be the live one. A
+# window in which neither the old nor the new path is excluded does not fail
+# loudly: the nightly run just backs up ~15G it exists to skip, silently and
+# expensively. Keeping both costs three dead pattern lines that match nothing.
+#
+# TO REMOVE after the move: the /srv/<name> originals (/srv/backups/msgvault,
+# /srv/marketdata, /srv/msgvault/backup-cache) and this comment block. NOT the
+# /srv/datasets* lines further down - that store is not moving.
+/srv/data/backups/msgvault
+
 # Other machines' data: large, and not ours to restore.
 /srv/marketdata
+# transitional /srv/data mirror - see the block above.
+/srv/data/marketdata
 
 # The data-scout dataset store: a SECOND FILESYSTEM mounted over this tree.
 #
@@ -141,6 +162,8 @@
 /srv/docker/openclaw/config/cache
 /srv/docker/netdata/cache
 /srv/msgvault/backup-cache
+# transitional /srv/data mirror - see the block above the /srv/backups/msgvault line.
+/srv/data/msgvault/backup-cache
 /srv/docker/pihole/config/listsCache
 
 # Dagu's own state. Its run history is not worth restoring and the logs churn on

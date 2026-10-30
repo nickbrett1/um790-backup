@@ -91,6 +91,42 @@
 # Other machines' data: large, and not ours to restore.
 /srv/marketdata
 
+# The data-scout dataset store: a SECOND FILESYSTEM mounted over this tree.
+#
+# /srv/datasets (the @datasets subvolume) and /srv/datasets-cache (@cache) are
+# one btrfs filesystem on a second NVMe - UUID
+# 21d8744e-1425-4d9e-94ea-3361b9139a9c - mounted over /srv's ext4 tree. restic
+# walks into mounts (this job passes no --one-file-system, and that default is
+# load-bearing: it is also why bind-mounted service data is visible), so without
+# the two lines below a single nightly run copies the entire store to the NAS.
+#
+#   /srv/datasets-cache   pure reflink-shared object storage: every byte in it
+#                         is a reflink of something under a dataset's data/, so
+#                         a snapshot of the cache alone restores nothing that
+#                         could not be rebuilt from the payload. Never worth a
+#                         byte.
+#   /srv/datasets/*/data  the payload half of each dataset - the large,
+#                         re-obtainable part.
+#
+# The REST of each dataset directory is deliberately NOT excluded: README,
+# dvc.yaml, findings and the per-dataset git repository. They are small and
+# cannot be regenerated from anywhere, so they are the part a restore needs.
+#
+# `*` does not cross a '/' (restic matches per path component), so the glob
+# covers exactly one level: the data/ of a dataset sitting directly under
+# /srv/datasets. It matches NOTHING today - no dataset has been imported yet -
+# which is why it is safe to land before the first import.
+#
+# A dataset whose README says `reproducible: no` is the only copy of itself, so
+# its data must stay in the backup. NOTE that removing "its exclusion" is not
+# something this file can express while the glob above stands: a line cannot
+# carve one dataset back out of a pattern that matches it (restic 0.18.1 has no
+# negation - see the msgvault block above). Carving one out means narrowing the
+# glob to the reproducible datasets by name. Whoever imports such a dataset owns
+# that edit; do not assume the glob has it covered.
+/srv/datasets-cache
+/srv/datasets/*/data
+
 # Postgres data directories. The database contents are covered by pg_dump in the
 # dumps phase; copying the raw cluster would be inconsistent and far larger.
 # Note that this only holds because staging/ is no longer excluded - see above.
@@ -109,15 +145,15 @@
 
 # Dagu's own state. Its run history is not worth restoring and the logs churn on
 # every run.
-/srv/reader/docker/dagu/data/logs
-/srv/reader/docker/dagu/data/dagu-data
-/srv/reader/docker/dagu/data/dag-runs
-/srv/reader/docker/dagu/data/cache
-/srv/reader/docker/dagu/data/proc
-/srv/reader/docker/dagu/data/queue
-/srv/reader/docker/dagu/data/state
-/srv/reader/docker/dagu/data/auth
-/srv/reader/docker/dagu/data/scheduler
+/srv/docker/dagu/data/logs
+/srv/docker/dagu/data/dagu-data
+/srv/docker/dagu/data/dag-runs
+/srv/docker/dagu/data/cache
+/srv/docker/dagu/data/proc
+/srv/docker/dagu/data/queue
+/srv/docker/dagu/data/state
+/srv/docker/dagu/data/auth
+/srv/docker/dagu/data/scheduler
 
 # Synology and macOS filesystem litter.
 **/.DS_Store

@@ -128,6 +128,37 @@ MAX_SOURCE_GB="${MAX_SOURCE_GB:-70}"
 EXPECTED_MIN_CONTAINERS="${EXPECTED_MIN_CONTAINERS:-60}"
 CHECK_READ_SUBSET="${CHECK_READ_SUBSET:-10%}"    # weekly cadence, so 10% each run
 
+# How long `check` waits for a lock it did not create. `backup` has had
+# --retry-lock 5m since it was written; `check` had NO lock handling at all, and
+# that asymmetry is a defect of its own, not a missing nicety:
+#
+# 2026-11-01, Dagu run 034pwBQBikAhf43qxfM06p. `backup` succeeded — snapshot
+# f35a24c4, 28,194 files / 63.98 GiB — and `check` then failed three times
+# (initial plus two automatic retries) with
+#
+#     repository is already locked by PID 532492 on ryzen
+#     lock was created at 2026-10-31 16:01:21 (12h54m43s ago)
+#
+# That lock was SHARED, from an ad-hoc `restic ls latest /srv/datasets...` in an
+# interactive session killed before it could release it. Shared-vs-exclusive is
+# the part that is not obvious: `restic backup` also takes a shared lock, so the
+# backup phase was never blocked, while `restic check` needs an EXCLUSIVE one and
+# could not start. A 13-hour-old lock belonging to a dead PID therefore cost the
+# run its snapshot, prune and status phases — last_success went stale even though
+# the snapshot had landed, which reads like "the backup failed" and was not.
+# restic never removes a stale lock by itself, and nothing in the DAG had ever
+# run `restic unlock`.
+#
+# do_check now runs `restic unlock` before checking, which retires the stale case
+# entirely. This timeout covers the OTHER case, which the unlock cannot: a lock
+# whose owner is still ALIVE — a dashboard query, a hand-run `restic snapshots`,
+# an overlapping job holding shared for a few seconds. 10m is long against
+# "a few seconds" and short against the 6h SNAPSHOT_MAX_AGE window a run has to
+# finish inside, and it is the same shape as backup's 5m (longer because a check
+# is the last thing an operator is waiting on at 02:00, and giving up early buys
+# nothing: retrying the phase re-reads the whole 10% subset).
+CHECK_RETRY_LOCK="${CHECK_RETRY_LOCK:-10m}"
+
 # A DEADLINE ON THE SQLITE PRIMARY PATH, because sqlite3's `.backup` has none of
 # its own: when the live database is locked, or keeps changing under the copy, the
 # CLI sleeps 250ms and retries forever. Measured on 2026-10-30 — mailroom's
@@ -273,7 +304,7 @@ phases:
   config     reconstruct container configs from docker inspect, secrets redacted
   dumps      pg_dump the 4 Postgres DBs, VACUUM INTO the listed SQLite DBs
   backup     restic backup /srv + staging, then read the snapshot back to prove it
-  check      restic check (10% data read by default)
+  check      unlock stale restic locks, then restic check (10% data, 10m lock wait)
   snapshot   create a Btrfs share snapshot on the NAS (must precede prune)
   prune      forget --prune + sweep old snapshots; refuses without this run's snapshot
   status     write the last_success heartbeat — only called when everything passed
@@ -1143,11 +1174,44 @@ do_backup() {
 # ---------------------------------------------------------------------------
 do_check() {
   if [[ $DRY_RUN == 1 ]]; then
-    log "dry-run: would 'restic check' with --read-data-subset=${CHECK_READ_SUBSET}"
+    log "dry-run: would 'restic unlock' to retire locks left by a restic that died before releasing them"
+    log "dry-run: would 'restic check' with --read-data-subset=${CHECK_READ_SUBSET} --retry-lock ${CHECK_RETRY_LOCK}"
     return 0
   fi
   require_cmds restic
-  restic_run check --read-data-subset="$CHECK_READ_SUBSET" \
+
+  # RETIRE THE STALE LOCK BEFORE ASKING FOR AN EXCLUSIVE ONE. See CHECK_RETRY_LOCK
+  # for the run this comes from. Plain `unlock` — never `--remove-all`: without
+  # that flag restic removes a lock only when its timestamp is past the 30m stale
+  # window, or when it was written by this host and the PID is gone. A LIVE restic
+  # refreshes its lock every 5m, so a lock that is still in use is never past that
+  # window — that refresh is what makes this safe to run against a repository
+  # another process is legitimately using. `--remove-all` skips both checks and
+  # would evict a running backup, which is exactly why it must not appear here.
+  #
+  # The count is logged because 0 is the boring, expected number. Anything else
+  # means some restic invocation outlived its process and left the repository
+  # blocked for everyone who needs an exclusive lock, and that is worth seeing in
+  # the run log instead of being discovered as a mystery failure next month.
+  # `-v` is load-bearing: restic 0.18 (the pinned version) only reports how many
+  # locks it removed at verbose level, so without it a removal is silent.
+  local unlock_out lock_count
+  if unlock_out=$(restic_run unlock -v 2>&1); then
+    lock_count=$(printf '%s\n' "$unlock_out" \
+      | sed -n 's/.*successfully removed \([0-9][0-9]*\) lock.*/\1/p' | head -n 1)
+    lock_count=${lock_count:-0}
+    log "unlock: removed ${lock_count} stale lock(s)"
+    if (( lock_count > 0 )); then
+      log "unlock: ${lock_count} lock(s) were held by processes that no longer exist — some restic run died mid-flight; the lock's own PID/time is in 'restic list locks' if it recurs"
+    fi
+  else
+    # NOT fatal: `check` below needs the same repository and fails with the real
+    # error if it is genuinely unreachable. Dying here would replace a specific
+    # restic message with a vaguer one and skip the phase's own diagnostics.
+    log "WARNING: restic unlock failed; continuing to check, which reports the underlying error"
+  fi
+
+  restic_run check --read-data-subset="$CHECK_READ_SUBSET" --retry-lock "$CHECK_RETRY_LOCK" \
     || die "restic check failed"
   log "check ok (read-data-subset=${CHECK_READ_SUBSET})"
 }

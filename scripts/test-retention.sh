@@ -33,6 +33,13 @@
 # derived from reading the arguments.
 #
 # Run it by hand with: bash scripts/test-retention.sh
+#
+# SCOPE, extended on 2026-11-01: it also pins `do_check`'s lock handling (§6).
+# That is not a retention decision, but it is the same kind of thing — an argv
+# shape whose absence is invisible until the one night a lock exists — and it
+# costs no backups. The alternative (a second script) meant a second image build
+# in CI for a few milliseconds of assertions, so the header is wider than the
+# filename rather than the pipeline being longer.
 set -Eeuo pipefail
 IFS=$'\n\t'
 
@@ -583,6 +590,167 @@ else
 fi
 eq "a no-op sweep never calls nas_ssh" \
   "$(grep -c . "$PRUNE/nas-calls" || true)" "0"
+
+# ---------------------------------------------------------------------------
+# 6. do_check's lock handling — the argv and its ORDER, not the check itself
+# ---------------------------------------------------------------------------
+# `restic check` needs an EXCLUSIVE lock; `restic backup` is content with a shared
+# one. That asymmetry is why the 2026-11-01 run (Dagu 034pwBQBikAhf43qxfM06p)
+# backed up 63.98 GiB successfully and then failed `check` three times on a lock
+# left by a killed ad-hoc `restic ls` — shared, 13h old, owner long gone. The run
+# lost snapshot/prune/status, so last_success went stale with a fresh snapshot in
+# the repository, which reads as "the backup failed" and was not true.
+#
+# The fix is one extra command, one extra flag, and their ORDER. All three can be
+# silently undone by an innocent-looking edit, and the phase still "works" until
+# a lock exists, so this is exactly what a test has to pin. No restic, no
+# repository, no network: `restic_run` is stubbed and every argument is recorded.
+section "do_check lock handling (restic stubbed)"
+
+CHECK=$TMP/check
+mkdir -p "$CHECK"
+
+# check_run <unlock_rc> <check_rc> <unlock_output>
+#   Prints the phase's combined output; returns do_check's exit status.
+check_run() {
+  local urc=$1 crc=$2 uout=$3
+  : > "$CHECK/calls"
+  (
+    set +e
+    DRY_RUN=0
+    # shellcheck disable=SC2317  # called by the sourced do_check, not here
+    require_cmds() { :; }
+    # shellcheck disable=SC2317
+    restic_run() {
+      # IFS is $'\n\t' in this file, so "$*" would join with a NEWLINE and the
+      # order assertions below would read one multi-line blob. Space it, the way
+      # join_space does in the runner.
+      local IFS=' '
+      printf '%s\n' "$*" >> "$CHECK/calls"
+      case ${1:-} in
+        unlock)
+          if [[ -n $uout ]]; then
+            printf '%s\n' "$uout"
+          fi
+          return "$urc"
+          ;;
+        check) return "$crc" ;;
+        *) return 1 ;;
+      esac
+    }
+    do_check
+  ) 2>&1
+}
+
+# THE CONTROL: the happy path must reach `check ok`, or every case below could
+# pass against a do_check that dies before running anything.
+rc=0
+out=$(check_run 0 0 'successfully removed 1 locks') || rc=$?
+eq "control: a clean unlock+check succeeds" "$rc" "0"
+if [[ $out == *'check ok'* ]]; then
+  pass "control: reported check ok"
+else
+  fail "control: never reported check ok (output: $(printf '%s' "$out" | tr '\n' '|'))"
+fi
+
+# THE ORDER. This is the assertion the incident needs: an unlock that runs after
+# the check is worse than none, because it reports having cleaned up while the
+# exclusive lock it was meant to clear had already failed the phase.
+eq "unlock runs before check" \
+  "$(head -n 1 "$CHECK/calls" | cut -d' ' -f1)" "unlock"
+eq "check is the second restic call" \
+  "$(sed -n '2p' "$CHECK/calls" | cut -d' ' -f1)" "check"
+eq "exactly two restic calls (no stray repo command)" \
+  "$(grep -c . "$CHECK/calls" || true)" "2"
+
+# THE FLAGS. --retry-lock on check is the half that covers a LIVE lock holder
+# (a dashboard query, a hand-run `restic snapshots`); --remove-all must never
+# appear on the unlock, which may only retire locks whose owner is gone.
+if grep -qE '^check .*--retry-lock [^ ]+' "$CHECK/calls"; then
+  pass "check carries --retry-lock"
+else
+  fail "check does not carry --retry-lock (calls: $(tr '\n' '|' < "$CHECK/calls"))"
+fi
+if grep -qE '^check .*--read-data-subset=10%' "$CHECK/calls"; then
+  pass "check still carries the configured --read-data-subset"
+else
+  fail "check lost --read-data-subset (calls: $(tr '\n' '|' < "$CHECK/calls"))"
+fi
+if grep -qE '^unlock .*--remove-all' "$CHECK/calls"; then
+  fail "unlock used --remove-all - that can evict a live backup's lock"
+else
+  pass "unlock does not use --remove-all"
+fi
+
+# THE LOG. A non-zero removal count is the only in-run signal that some other
+# restic died mid-flight; 0 is the normal number and must read as normal.
+if [[ $out == *'removed 1 stale lock'* ]]; then
+  pass "a removal is reported with its count"
+else
+  fail "removal count not logged (output: $(printf '%s' "$out" | tr '\n' '|'))"
+fi
+rc=0
+out=$(check_run 0 0 '') || rc=$?
+eq "no locks to remove is still a successful check" "$rc" "0"
+if [[ $out == *'removed 0 stale lock'* ]]; then
+  pass "nothing removed is reported as 0, not left silent"
+else
+  fail "zero removals not logged (output: $(printf '%s' "$out" | tr '\n' '|'))"
+fi
+
+# A FAILED CHECK MUST STILL FAIL THE PHASE. The unlock is not a licence to report
+# success; this is the guard that keeps the fix from turning a red run green.
+rc=0
+out=$(check_run 0 1 'no locks found') || rc=$?
+eq "a failing check fails the phase" "$rc" "1"
+if [[ $out == *'check ok'* ]]; then
+  fail "a failing check still reported check ok"
+else
+  pass "a failing check does not report check ok"
+fi
+
+# A FAILED UNLOCK IS A WARNING, NOT A STOP. check needs the same repository and
+# reports the real error with more context; dying in the unlock would replace a
+# specific restic message with a vaguer one. Pinned because "make unlock failure
+# fatal" is a plausible future edit that would hide that message.
+rc=0
+out=$(check_run 1 0 'Fatal: unable to open config file') || rc=$?
+eq "a failed unlock does not stop the check" "$rc" "0"
+if [[ $out == *'WARNING: restic unlock failed'* ]]; then
+  pass "a failed unlock says so and continues"
+else
+  fail "a failed unlock was not reported (output: $(printf '%s' "$out" | tr '\n' '|'))"
+fi
+eq "a failed unlock still runs check" \
+  "$(sed -n '2p' "$CHECK/calls" | cut -d' ' -f1)" "check"
+
+# --dry-run must stay honest about the new command: it is the CI smoke gate's
+# only view of this phase, and a dry-run that claims to check without mentioning
+# the unlock would be a small lie in the one place people look.
+rc=0
+: > "$CHECK/calls"
+out=$(
+  set +e
+  DRY_RUN=1
+  require_cmds() { :; }
+  # Recording the call is the assertion: a dry-run must log what it would do and
+  # run nothing, so this file must stay empty. (`fail` cannot be called from here
+  # - the subshell's FAILED would not reach the parent, which is the classic way
+  # a negative assertion silently passes.)
+  restic_run() {
+    local IFS=' '
+    printf '%s\n' "$*" >> "$CHECK/calls"
+  }
+  do_check 2>&1
+) || rc=$?
+eq "dry-run check exits 0" "$rc" "0"
+eq "dry-run runs no restic command at all" \
+  "$(grep -c . "$CHECK/calls" || true)" "0"
+if [[ $out == *'restic unlock'* && $out == *'--retry-lock'* ]]; then
+  pass "dry-run names the unlock and the retry-lock"
+else
+  fail "dry-run does not name the new commands (output: $(printf '%s' "$out" | tr '\n' '|'))"
+fi
 
 # ---------------------------------------------------------------------------
 if (( FAILED )); then

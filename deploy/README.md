@@ -87,6 +87,14 @@ only part of `prune` that can lose data. So the gate drives the real code:
 It reads `RESTIC_KEEP_ARGS` from the runner rather than restating it, so changing
 the policy without thinking about its effect fails the gate.
 
+- `do_check`'s lock handling — that `restic unlock` runs **before** `restic
+  check`, that check carries `--retry-lock`, and that the unlock never uses
+  `--remove-all`. The order is the part that matters: `check` needs an
+  *exclusive* lock while `backup` is satisfied with a shared one, so a shared
+  lock left by a killed ad-hoc `restic ls` failed the 2026-11-01 run's check
+  three times after its backup had succeeded. See `CHECK_RETRY_LOCK` in the
+  runner.
+
 What this still does **not** cover: DSM. The real `synosharesnapshot list`
 output, the actual snapshot name format, and the delete call have never run
 against a NAS. Run the phases by hand once (§4) before enabling the schedule.

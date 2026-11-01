@@ -725,6 +725,12 @@ do_preflight() {
   install -d -m 0700 "$STATE" "$CACHE" || die "cannot create state/cache under ${BASE}"
   [[ -w $BASE ]] || die "${BASE} is not writable by uid $(id -u)"
 
+  # A new run starts with no failure reason. The reason file is written by a
+  # failed phase and consumed by the fail container of the SAME run (they are
+  # both keyed on DAG_RUN_ID as well), and this is the third guard: a run whose
+  # failure predates both of them must not hand its cause to tonight's message.
+  rm -f "$STATE/last_failure" 2>/dev/null || true
+
   # Install the exclude list BEFORE any network work. It is a local precondition:
   # if the image was built without deploy/exclude.txt there is no backup worth
   # making, and finding that out after the NAS round-trip and under a taken lock
@@ -1507,14 +1513,310 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# THE FAILURE MESSAGE. Four facts, in this order, and nothing else.
+# ---------------------------------------------------------------------------
+# The message that reached the operator for run 034pwBQBikAhf43qxfM06p, in full:
+#
+#   title: um790 backup FAILED
+#   body:  run 034pwBQBikAhf43qxfM06p failed at: check
+#
+# It was unactionable at 03:31, and each of the four things below is one of the
+# reasons why:
+#
+#   1. it did not name the job. "backup" is one of several jobs on this host;
+#   2. "check" is a phase name, and it reads like a health check rather than the
+#      restic verification that runs after the backup;
+#   3. it carried no reason at all, while the phase's stderr held the single line
+#      that made the incident diagnosable in seconds: `unable to create lock in
+#      backend: repository is already locked by PID ...`;
+#   4. "backup FAILED" does not distinguish a failed backup from a backup that
+#      succeeded and whose verification then failed — which is what happened
+#      (snapshot f35a24c4 was written; check, snapshot, prune and status were
+#      skipped). Read from a phone, that message says there is no snapshot
+#      tonight, and that was false.
+#
+# The counters that keep this honest: /srv on ryzen is named in the body, the
+# phase is in the TITLE so it is visible without opening anything, the phase name
+# is translated, the reason is the failing tool's own words, and the snapshot
+# claim is DERIVED FROM THE PHASE ORDER rather than guessed (see
+# failure_snapshot_state — wrong in either direction is worse than silent).
+
+# The phase vocabulary is the script's, not the operator's. A phase missing from
+# this table prints nothing and the caller falls back to the raw name: inventing
+# a description for a phase we do not recognise is how a message starts lying.
+phase_description() { # phase
+  case ${1:-} in
+    preflight) printf 'preflight checks' ;;
+    config)    printf 'container config capture' ;;
+    dumps)     printf 'database dumps' ;;
+    backup)    printf 'restic backup' ;;
+    check)     printf 'restic repository check' ;;
+    snapshot)  printf 'NAS snapshot' ;;
+    prune)     printf 'snapshot prune' ;;
+    status)    printf 'status heartbeat' ;;
+    *)         printf '' ;;
+  esac
+}
+
+# WHETHER THIS RUN'S SNAPSHOT EXISTS, read off the phase order and nothing else:
+#
+#   preflight -> config -> dumps -> backup -> check -> snapshot -> prune -> status
+#
+# `backup` is the phase that writes the snapshot, so every phase after it can only
+# fail on work that runs against a repository which already holds tonight's
+# snapshot. A failure in check/snapshot/prune/status therefore means the DATA IS
+# BACKED UP and only the verification or the bookkeeping did not finish — and a
+# failure in preflight/config/dumps/backup means it is not. Unknown (including
+# the wrapper's `unknown step` placeholder) gets `unknown` and the caller says
+# nothing, because a confident wrong answer here is worse than no answer.
+#
+# Deliberately not derived from $STATE/backup_done.epoch: the phase order is a
+# property of the DAG, the epoch file is a property of a mount that may be the
+# very thing that failed.
+failure_snapshot_state() { # phase -> after | before | unknown
+  case ${1:-} in
+    check|snapshot|prune|status)   printf 'after\n' ;;
+    preflight|config|dumps|backup) printf 'before\n' ;;
+    *)                             printf 'unknown\n' ;;
+  esac
+}
+
+# A reason must never carry a credential into a notification body, into the state
+# file it waits in, or into a log. Phase stderr can hold anything a tool chose to
+# print, so a line shaped like a credential ASSIGNMENT is dropped outright rather
+# than redacted in place: the value's length and shape are themselves information,
+# and a dropped reason simply degrades to the static message, which is what the
+# notifier sent before this existed.
+reason_is_secret_shaped() { # text
+  local t=${1:-}
+  t=${t,,}
+  [[ $t =~ (password|passwd|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|authorization|bearer)[[:space:]]*[=:] ]]
+}
+
+# The failing tool's own words, out of a phase's captured stderr.
+#
+# Deliberately NOT "the last line". restic 0.18.1's lock failure, verbatim from
+# this image against a throwaway repository:
+#
+#   repo already locked, waiting up to 1s for the lock
+#   unable to create lock in backend: repository is already locked by PID 995832
+#     on ... by nick (UID 1001, GID 100)
+#   lock was created at 2026-10-31 16:01:21 (2.05136208s ago)
+#   storage ID b67aeb07
+#   the `unlock` command can be used to remove stale locks
+#
+# The LAST line there is advice, and taking it would have produced a reason that
+# says nothing about the cause. So: the trailing block of non-runner lines is
+# trimmed from its last error-shaped line, trailing advice is dropped, the rest
+# is joined, whitespace-collapsed and capped. When the phase printed no tool line
+# at all, the runner's own die message is the reason — it is usually the
+# informative one ("snapshot count did not increase (8 -> 8) — ...").
+#
+# Every way this can come back empty (no capture, nothing usable, secret-shaped)
+# means "send the static message", never "send nothing".
+phase_failure_reason() { # capture-file
+  local cap=${1:-}
+  local -a lines=() block=()
+  local i start=-1 end reason='' fallback='' line t
+  # 160 chars keeps the whole body near 300 with the other three lines, which is
+  # what a lock screen shows. The untruncated text is in the Dagu log either way.
+  local max=160
+
+  [[ -n $cap && -r $cap ]] || return 0
+  mapfile -t lines < "$cap" || return 0
+  (( ${#lines[@]} )) || return 0
+
+  # Every line the runner writes is timestamped and bracketed; a tool's output is
+  # not. `die` logs LAST, so the shape of a failure is
+  #
+  #   <runner line> <tool output...> <runner FATAL line>
+  #
+  # i.e. the tool's words are the contiguous block of non-runner lines BEFORE the
+  # trailing runner lines. Earlier bad blocks elsewhere in the phase (a warning,
+  # another command's chatter) are separated from this one by a runner line and
+  # are therefore not considered.
+  local log_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z \[[^]]*\] '
+  local blank=0
+  i=$(( ${#lines[@]} - 1 ))
+  while (( i >= 0 )); do
+    blank=0
+    [[ -n ${lines[i]//[[:space:]]/} ]] || blank=1
+    if (( blank )); then i=$(( i - 1 )); continue; fi
+    if [[ ${lines[i]} =~ $log_re ]]; then
+      # Keep the LAST runner line seen (we are walking backwards, so the first one
+      # we meet is the last in the file): it is the fallback reason when the tool
+      # printed nothing of its own.
+      [[ -n $fallback ]] || fallback=${lines[i]}
+      i=$(( i - 1 ))
+      continue
+    fi
+    break
+  done
+
+  if (( i >= 0 )); then
+    # Walk the tool's block backwards, then keep it in order.
+    end=$(( i + 1 ))
+    while (( i >= 0 )) && [[ -n ${lines[i]//[[:space:]]/} ]] && ! [[ ${lines[i]} =~ $log_re ]]; do
+      i=$(( i - 1 ))
+    done
+    start=$(( i + 1 ))
+    for (( i = start; i < end; i++ )); do
+      block+=("${lines[i]}")
+    done
+  fi
+
+  if (( ${#block[@]} )); then
+    local err_re='^(unable to|fatal|error|failed|cannot|could not|no such|permission denied|panic|repository is already locked|wrong password|invalid|ssh:|signal:)'
+    # Trailing advice, not cause: restic ends a lock failure with "storage ID
+    # b67aeb07" then "the `unlock` command can be used to remove stale locks".
+    local advice_re='^(storage id |the .*command can be used|please |try |note: )'
+    for (( i = ${#block[@]} - 1; i >= 0; i-- )); do
+      if [[ ${block[i],,} =~ $err_re ]]; then start=$i; break; fi
+    done
+    (( start >= 0 )) || start=0
+    end=${#block[@]}
+    while (( end > start + 1 )) && [[ ${block[end-1],,} =~ $advice_re ]]; do
+      end=$(( end - 1 ))
+    done
+    for (( i = start; i < end; i++ )); do reason+="${block[i]} "; done
+  fi
+
+  if [[ -z $reason && -n $fallback ]]; then
+    t=$fallback
+    if [[ $t =~ $log_re ]]; then t=${t:${#BASH_REMATCH[0]}}; fi
+    reason=$t
+  fi
+  reason=${reason#FATAL: }
+  reason=${reason#WARNING: }
+  # One line, whatever the tool printed.
+  reason=$(printf '%s' "$reason" | tr -s '[:space:]' ' ')
+  reason=${reason# }
+  reason=${reason% }
+
+  if (( ${#reason} > max )); then
+    # Cut on a word boundary: half a number ("(2.05…") reads like corruption, and
+    # the whole of it is in the log.
+    reason=${reason:0:$(( max - 1 ))}
+    reason="${reason% *}…"
+  fi
+  if reason_is_secret_shaped "$reason"; then
+    return 0
+  fi
+  printf '%s\n' "$reason"
+}
+
+# Persist the reason for `fail` — a DIFFERENT container — to pick up.
+#
+# Why a file and not `-e FAIL_REASON=...`: the value would go through the
+# wrapper's `docker run` argv, i.e. into the process list, which is exactly where
+# the wrapper is careful not to put secrets (`-e RESTIC_PASSWORD` with no value).
+# $BASE/state is the one path the failing phase and the fail container already
+# share, it is excluded from the backup (deploy/exclude.txt), and the file holds
+# an already-scrubbed, length-capped single line. It is consumed by do_fail and
+# cleared by preflight, so a reason can never attach to a later run.
+#
+# Called from main AFTER the phase has exited, so it cannot change the phase's
+# exit code: there is no phase left to affect.
+record_failure_reason() { # phase rc capture-file
+  local phase=${1:-} rc=${2:-0} cap=${3:-} reason tmp
+  (( rc != 0 )) || return 0
+  reason=$(phase_failure_reason "$cap" 2>/dev/null || true)
+  [[ -n $reason ]] || return 0
+
+  install -d -m 0700 "$STATE" 2>/dev/null || return 0
+  tmp=$(mktemp "$STATE/.last_failure.XXXXXX" 2>/dev/null) || return 0
+  chmod 0600 "$tmp" 2>/dev/null || true
+  if ! printf 'run=%s\nreason=%s\n' "${DAG_RUN_ID:-}" "$reason" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 0
+  fi
+  mv -f "$tmp" "$STATE/last_failure" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+  log "recorded failure reason for ${phase}: ${reason}"
+}
+
+# The reason recorded for THIS run, if any. Consumed either way: it describes one
+# failure, and leaving it behind would attach this run's cause to a later message.
+recorded_failure_reason() {
+  local f=$STATE/last_failure run='' reason='' line
+  local -a l=()
+  [[ -r $f ]] || return 0
+  # mapfile, not `sed | head`: IFS is $'\n\t' here and a pipeline under pipefail
+  # can hand back 141 (SIGPIPE) from a `head` that quit early, which under `set -e`
+  # would abort do_fail — a notifier failure changing a run's result.
+  mapfile -t l < "$f" 2>/dev/null || true
+  for line in "${l[@]}"; do
+    case $line in
+      run=*)    run=${line#run=} ;;
+      reason=*) reason=${line#reason=} ;;
+    esac
+  done
+  rm -f "$f" 2>/dev/null || true
+  [[ $run == "${DAG_RUN_ID:-}" ]] || return 0
+  if reason_is_secret_shaped "$reason"; then return 0; fi
+  printf '%s\n' "$reason"
+}
+
+# The wrapper's placeholder for "there was no phase to name" (a hand-started
+# `fail`, or a handler that could not know). It is not a phase name and must
+# never be printed as one; any OTHER unrecognised name is still worth showing,
+# because a future phase is a fact and "unknown step" is an absence.
+phase_named() { # phase
+  [[ -n ${1:-} && ${1:-} != 'unknown step' ]]
+}
+
+failure_title() { # phase
+  if phase_named "${1:-}"; then
+    printf 'um790 backup FAILED: %s\n' "$1"
+  else
+    printf 'um790 backup FAILED\n'
+  fi
+}
+
+# The body. Plain text, no markdown (ntfy renders it as-is), four facts in
+# priority order, ~300 characters so it is readable on a lock screen.
+failure_body() { # phase reason run-id
+  local where=${1:-} reason=${2:-} run_id=${3:-} desc state
+  desc=$(phase_description "$where")
+  state=$(failure_snapshot_state "$where")
+
+  # 1. WHAT JOB — named as the restic backup of /srv on ryzen, because "um790
+  #    backup" alone is one of several jobs on this host.
+  if [[ -n $desc ]]; then
+    printf 'restic backup of /srv on ryzen — %s failed' "$desc"
+  elif phase_named "$where"; then
+    printf 'restic backup of /srv on ryzen — %s failed' "$where"
+  else
+    printf 'restic backup of /srv on ryzen — failed'
+  fi
+  # 2. WHY — the failing tool's own words. The highest-value line, and the one
+  #    the 2026-10-31 message did not carry.
+  if [[ -n $reason ]]; then
+    printf '\nwhy: %s' "$reason"
+  fi
+  # 3. WHAT STILL HOLDS — omitted entirely when the phase is unknown.
+  case $state in
+    after)  printf '\nsafe: this run'"'"'s snapshot is in the repository' ;;
+    before) printf '\nsafe: no snapshot from this run — the backup did not finish' ;;
+  esac
+  # 4. WHICH RUN — the pointer into the log and the Dagu history, not buried.
+  printf '\nrun %s\n' "${run_id:-?}"
+}
+
+# ---------------------------------------------------------------------------
 do_fail() {
-  local where="${DAG_STATUS:-unknown step}"
+  local where="${DAG_STATUS:-unknown step}" reason title body
   if [[ $DRY_RUN == 1 ]]; then
     log "dry-run: would release the run lock and notify FAILED (step=${where})"
     return 0
   fi
   rm -f "$STATE/run.lock"
-  notify high "um790 backup FAILED" "run ${DAG_RUN_ID:-?} failed at: ${where}"
+  # Read before anything is sent, and consumed on the way: the reason belongs to
+  # this failure only. Absent, empty, unreadable or scrubbed-away all mean the
+  # same thing here - the message goes out with the three static facts.
+  reason=$(recorded_failure_reason || true)
+  title=$(failure_title "$where")
+  body=$(failure_body "$where" "$reason" "${DAG_RUN_ID:-}")
+  notify high "$title" "$body"
   log "failure recorded at ${where}"
 }
 
@@ -1538,6 +1840,48 @@ main() {
     log "DRY RUN — no secrets read, no repo opened, no host modified"
   fi
 
+  # `fail` is not a phase: it is the notifier, it runs after a phase already
+  # failed, and it must exit 0 on every path.
+  if [[ $PHASE == fail ]]; then
+    do_fail
+    return 0
+  fi
+
+  # A dry run stays the trivial path: nothing to capture, nothing to notify.
+  if [[ $DRY_RUN == 1 ]]; then
+    dispatch_phase
+    return
+  fi
+
+  local rc=0 cap=''
+  cap=$(mktemp 2>/dev/null || true)
+  if [[ -z $cap ]]; then
+    # No scratch space: run the phase exactly as before. The cost is the reason,
+    # never the run or the message.
+    dispatch_phase
+    return
+  fi
+  # STDERR IS STREAMED AND CAPTURED AT ONCE, because the two things it is needed
+  # for happen at different times: the Dagu log (and a human watching a 12-minute
+  # dumps phase) needs it live, and the failure message needs the last thing the
+  # tool said. `2>&1 1>&4` points fd 2 at the pipe while fd 1 keeps the real
+  # stdout, so the phase's own stdout is untouched; tee forwards every line.
+  #
+  # The phase runs in a subshell of the pipeline, so `die`'s `exit 1` ends that
+  # subshell and PIPESTATUS[0] carries the phase's status up unchanged - the
+  # phase's exit code is still the step's exit code. record_failure_reason runs
+  # AFTER it, in this shell, when there is no phase left to disturb.
+  exec 4>&1
+  { dispatch_phase; } 2>&1 1>&4 | tee "$cap" >&2 || rc=$?
+  exec 4>&-
+  record_failure_reason "$PHASE" "$rc" "$cap" || true
+  rm -f "$cap" 2>/dev/null || true
+  return "$rc"
+}
+
+# The one place the phase name becomes a function call. Split out of main so the
+# stderr capture above wraps the WHOLE phase and nothing else.
+dispatch_phase() {
   case $PHASE in
     preflight) do_preflight ;;
     config)    do_config ;;
@@ -1547,7 +1891,7 @@ main() {
     snapshot)  do_snapshot ;;
     prune)     do_prune ;;
     status)    do_status ;;
-    fail)      do_fail ;;
+    *)         die "no dispatcher for phase: ${PHASE}" ;;
   esac
 }
 

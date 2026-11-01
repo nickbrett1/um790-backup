@@ -34,12 +34,13 @@
 #
 # Run it by hand with: bash scripts/test-retention.sh
 #
-# SCOPE, extended on 2026-11-01: it also pins `do_check`'s lock handling (§6).
-# That is not a retention decision, but it is the same kind of thing — an argv
-# shape whose absence is invisible until the one night a lock exists — and it
-# costs no backups. The alternative (a second script) meant a second image build
-# in CI for a few milliseconds of assertions, so the header is wider than the
-# filename rather than the pipeline being longer.
+# SCOPE, extended on 2026-11-01: it also pins `do_check`'s lock handling (§6) and
+# the failure notification's wording (§7). Neither is a retention decision, but
+# both are the same kind of thing — a shape whose absence is invisible until the
+# night it matters (an exclusive lock, or a message nobody can act on from a
+# phone at 03:31) — and both cost no backups. The alternative (a second script)
+# meant a second image build in CI for a few milliseconds of assertions, so the
+# header is wider than the filename rather than the pipeline being longer.
 set -Eeuo pipefail
 IFS=$'\n\t'
 
@@ -750,6 +751,287 @@ if [[ $out == *'restic unlock'* && $out == *'--retry-lock'* ]]; then
   pass "dry-run names the unlock and the retry-lock"
 else
   fail "dry-run does not name the new commands (output: $(printf '%s' "$out" | tr '\n' '|'))"
+fi
+
+# ---------------------------------------------------------------------------
+# 7. the failure notification — what a phone is shown at 03:31
+# ---------------------------------------------------------------------------
+# The message that actually reached the operator for run 034pwBQBikAhf43qxfM06p
+# was, in full, "um790 backup FAILED" / "run 034pwBQBikAhf43qxfM06p failed at:
+# check". It named no job, carried no reason (the restic lock line that made the
+# incident diagnosable in seconds was in the phase's stderr and nowhere else), and
+# it read as "there is no snapshot tonight" when the snapshot had in fact been
+# written and only the verification after it failed.
+#
+# So each block below pins one of the four facts the body now has to carry, plus
+# the two ways the reason can arrive (a tool's own line, the runner's die line)
+# and the three ways it must NOT arrive (absent, secret-shaped, another run's).
+# The fixtures are restic 0.18.1's real output, captured against a throwaway
+# repository while another restic held the lock; a hand-written approximation
+# would have let a "last line is the reason" implementation pass, and that
+# implementation would have reported "the `unlock` command can be used to remove
+# stale locks" as the cause.
+section "failure notification"
+
+NOTE=$TMP/notify
+mkdir -p "$NOTE"
+
+fixture() { # name, then lines on stdin
+  cat > "$NOTE/$1"
+}
+
+fixture restic-lock <<'EOF'
+2026-10-31T16:02:00Z [check] unlock: removed 0 stale lock(s)
+using temporary cache in /tmp/restic-check-cache-370709322
+create exclusive lock for repository
+repo already locked, waiting up to 10m0s for the lock
+unable to create lock in backend: repository is already locked by PID 532492 on ryzen by nick (UID 1001, GID 100)
+lock was created at 2026-10-31 16:01:21 (2.05136208s ago)
+storage ID b67aeb07
+the `unlock` command can be used to remove stale locks
+2026-10-31T16:02:09Z [check] FATAL: restic check failed
+EOF
+
+fixture die-only <<'EOF'
+2026-10-31T16:02:09Z [snapshot] FATAL: snapshot count did not increase (8 -> 8) — treating a silent no-op as failure
+EOF
+
+fixture secret <<'EOF'
+RESTIC_PASSWORD=hunter2supersecret: authentication failed
+2026-10-31T16:02:09Z [backup] FATAL: restic backup failed
+EOF
+
+# The cause, not the tail. restic's last line here is ADVICE; taking it would have
+# produced a reason that says nothing about why the phase failed.
+reason=$(phase_failure_reason "$NOTE/restic-lock")
+if [[ $reason == 'unable to create lock in backend: repository is already locked by PID 532492'* ]]; then
+  pass "the reason is the tool's own error line"
+else
+  fail "the reason is not the restic error line (got '${reason}')"
+fi
+if [[ $reason == *'lock was created at 2026-10-31 16:01:21'* ]]; then
+  pass "the reason keeps the continuation that dates the lock"
+else
+  fail "the reason dropped the lock timestamp (got '${reason}')"
+fi
+if [[ $reason == *'storage ID'* || $reason == *'command can be used'* ]]; then
+  fail "trailing advice leaked into the reason (got '${reason}')"
+else
+  pass "trailing advice is not the reason"
+fi
+# A lock screen, not a log: capped, and on a word boundary rather than mid-number.
+if (( ${#reason} <= 161 )) && [[ $reason != *'2.05…'* ]]; then
+  pass "the reason is capped on a word boundary"
+else
+  fail "the reason is not capped cleanly (${#reason} chars: '${reason}')"
+fi
+
+# A phase that dies without any tool output still carries the runner's own line,
+# which is usually the informative one (here: the guard that fired).
+eq "a die-only failure uses the runner's message" \
+  "$(phase_failure_reason "$NOTE/die-only")" \
+  'snapshot count did not increase (8 -> 8) — treating a silent no-op as failure'
+
+# Anything shaped like a credential assignment drops the whole reason rather than
+# being redacted in place or trusted. The value's shape is information too.
+eq "a secret-shaped reason is dropped" \
+  "$(phase_failure_reason "$NOTE/secret")" ""
+eq "a bare password match without an assignment is not a secret" \
+  "$(reason_is_secret_shaped 'wrong password or no key found'; echo "rc=$?")" "rc=1"
+eq "a token assignment is secret-shaped" \
+  "$(reason_is_secret_shaped 'api_token: abc123'; echo "rc=$?")" "rc=0"
+eq "an unreadable capture yields no reason" "$(phase_failure_reason /nonexistent/xyz)" ""
+
+# THE PHASE IS TRANSLATED. `check` reads like a health check to anyone who is not
+# this script, and it is precisely the phase that runs AFTER the backup.
+eq "check is translated" "$(phase_description check)" "restic repository check"
+eq "dumps is translated" "$(phase_description dumps)" "database dumps"
+eq "prune is translated" "$(phase_description prune)" "snapshot prune"
+eq "an unknown phase has no description" "$(phase_description nonsense)" ""
+
+# WHAT STILL HOLDS, from the phase order and not from a guess. Both directions
+# are asserted: claiming a snapshot when there is none is as wrong as the reverse.
+for p in check snapshot prune status; do
+  eq "a failure in ${p} is after the backup" "$(failure_snapshot_state "$p")" "after"
+done
+for p in preflight config dumps backup; do
+  eq "a failure in ${p} is before the backup" "$(failure_snapshot_state "$p")" "before"
+done
+eq "an unknown phase claims nothing" "$(failure_snapshot_state 'unknown step')" "unknown"
+
+# THE FOUR FACTS, in the body.
+body=$(failure_body check "$reason" 034pwBQBikAhf43qxfM06p)
+if [[ $body == 'restic backup of /srv on ryzen — restic repository check failed'* ]]; then
+  pass "1. the body names the job and the phase in operator words"
+else
+  fail "1. the body does not name the job (body: $(printf '%s' "$body" | tr '\n' '|'))"
+fi
+if [[ $body == *$'\n'why:\ unable\ to\ create\ lock* ]]; then
+  pass "2. the body carries the reason"
+else
+  fail "2. the body lost the reason (body: $(printf '%s' "$body" | tr '\n' '|'))"
+fi
+if [[ $body == *$'\nsafe: this run'"'"'s snapshot is in the repository'* ]]; then
+  pass "3. a post-backup failure says the snapshot is safe"
+else
+  fail "3. a post-backup failure does not say the snapshot is safe"
+fi
+if [[ $body == *$'\nrun 034pwBQBikAhf43qxfM06p'* ]]; then
+  pass "4. the body keeps the run id on its own line"
+else
+  fail "4. the body does not carry the run id"
+fi
+
+# The pre-backup phases must NOT claim a snapshot, and the unknown phase must say
+# nothing at all about one (a confident wrong answer is worse than silence).
+for p in preflight config dumps backup; do
+  b=$(failure_body "$p" '' r1)
+  if [[ $b == *'safe: no snapshot from this run'* && $b != *'in the repository'* ]]; then
+    pass "${p} says no snapshot was written"
+  else
+    fail "${p} claimed something about the snapshot (body: $(printf '%s' "$b" | tr '\n' '|'))"
+  fi
+done
+unknown_body=$(failure_body 'unknown step' '' r1)
+if [[ $unknown_body == *'safe:'* ]]; then
+  fail "an unknown phase claimed a snapshot state"
+else
+  pass "an unknown phase says nothing about the snapshot"
+fi
+eq "an unknown phase is not named in the title" "$(failure_title 'unknown step')" "um790 backup FAILED"
+eq "the title names the phase" "$(failure_title check)" "um790 backup FAILED: check"
+# A phase we do not have a description for is still a fact, so it is shown
+# verbatim - with no invented prose and no snapshot claim.
+eq "an unrecognised phase is shown verbatim in the title" \
+  "$(failure_title verify)" "um790 backup FAILED: verify"
+eq "an unrecognised phase is shown verbatim in the body" \
+  "$(failure_body verify '' r1 | head -n 1)" "restic backup of /srv on ryzen — verify failed"
+
+# The body has to stay readable on a lock screen.
+body_len=$(failure_body check "$reason" 034pwBQBikAhf43qxfM06p | wc -c)
+if (( body_len <= 320 )); then
+  pass "the body fits a lock screen (${body_len} chars)"
+else
+  fail "the body is ${body_len} chars, too long for a lock screen"
+fi
+# ...and no empty "why: " line when there is no reason. Absent, not blank.
+eq "no reason means no why line at all" \
+  "$(failure_body check '' r1 | grep -c '^why:' || true)" "0"
+
+# END TO END THROUGH do_fail, with curl stubbed: what is actually POSTed, how
+# many times, and whether the reason is consumed. `notify` shells out to `curl`
+# and `do_fail` posts exactly once - that is the in-image half of "one message
+# per run"; the other half is the wrapper's sentinel, which is host-side.
+mkdir -p "$NOTE/bin"
+cat > "$NOTE/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+# Records one record per invocation, one argv entry per line.
+{ printf -- '---CALL---\n'; printf '%s\n' "$@"; } >> "${CURL_ARGV:?}"
+STUB
+chmod +x "$NOTE/bin/curl"
+
+# fail_run <phase> <run-id> <reason-or-empty> <recorded-run-id-or-empty>
+fail_run() {
+  local where=$1 runid=$2 reason=${3:-} recorded=${4:-$2}
+  local state=$NOTE/state
+  rm -rf "$state"; mkdir -p "$state"
+  : > "$state/run.lock"
+  if [[ -n $reason ]]; then
+    printf 'run=%s\nreason=%s\n' "$recorded" "$reason" > "$state/last_failure"
+  fi
+  : > "$NOTE/argv"
+  (
+    set +e
+    STATE=$state
+    DAG_STATUS=$where
+    DAG_RUN_ID=$runid
+    NTFY_URL=http://ntfy.invalid/topic
+    # shellcheck disable=SC2030  # deliberately local to this subshell
+    PATH="$NOTE/bin:$PATH"
+    # shellcheck disable=SC2030
+    export CURL_ARGV=$NOTE/argv
+    do_fail
+  ) 2>"$NOTE/log"
+}
+
+fail_run check 034pwBQBikAhf43qxfM06p 'unable to create lock in backend: repository is already locked by PID 532492'
+eq "one message per run" "$(grep -c -- '---CALL---' "$NOTE/argv" || true)" "1"
+if grep -qx 'Title: um790 backup FAILED: check' "$NOTE/argv"; then
+  pass "the posted title names the phase"
+else
+  fail "the posted title does not name the phase (argv: $(tr '\n' '|' < "$NOTE/argv"))"
+fi
+if grep -qx 'Priority: high' "$NOTE/argv"; then
+  pass "a failure is still high priority"
+else
+  fail "the priority changed"
+fi
+if grep -qx 'why: unable to create lock in backend: repository is already locked by PID 532492' "$NOTE/argv"; then
+  pass "the posted body carries the recorded reason"
+else
+  fail "the posted body lost the reason (argv: $(tr '\n' '|' < "$NOTE/argv"))"
+fi
+eq "the posted body says the snapshot is safe" \
+  "$(grep -cx "safe: this run's snapshot is in the repository" "$NOTE/argv" || true)" "1"
+eq "the run id is in the posted body" \
+  "$(grep -cx 'run 034pwBQBikAhf43qxfM06p' "$NOTE/argv" || true)" "1"
+eq "do_fail releases the run lock" "$([[ -f $NOTE/state/run.lock ]] && echo present || echo gone)" "gone"
+eq "do_fail exits 0" "$(fail_run check r1 'x' >/dev/null 2>&1; echo $?)" "0"
+
+# The reason is consumed: one failure, one message. Re-running do_fail for the
+# same run must not carry a stale cause.
+fail_run check 034pwBQBikAhf43qxfM06p 'unable to create lock in backend: x'
+do_fail_again() {
+  (
+    set +e
+    STATE=$NOTE/state; DAG_STATUS=check; DAG_RUN_ID=034pwBQBikAhf43qxfM06p
+    NTFY_URL=http://ntfy.invalid/topic
+    # shellcheck disable=SC2030,SC2031
+    PATH="$NOTE/bin:$PATH"
+    # shellcheck disable=SC2030,SC2031
+    export CURL_ARGV=$NOTE/argv2
+    : > "$NOTE/argv2"
+    do_fail
+  ) 2>/dev/null
+}
+do_fail_again
+eq "the reason is consumed by the first message" \
+  "$(grep -c '^why:' "$NOTE/argv2" || true)" "0"
+
+# Another run's reason is never attached to this run's message (and is still
+# consumed, so it cannot leak forward either).
+fail_run check 034pwBQBikAhf43qxfM06p 'unable to create lock in backend: yesterday' some-other-run
+eq "another run's reason is ignored" "$(grep -c '^why:' "$NOTE/argv" || true)" "0"
+eq "another run's reason is not left behind" \
+  "$([[ -f $NOTE/state/last_failure ]] && echo present || echo gone)" "gone"
+
+# A secret-shaped record is refused at the point of use too, not only at the point
+# of capture: a reason file written by an older image must not leak a credential.
+fail_run backup r1 'RESTIC_PASSWORD=hunter2supersecret'
+eq "a secret-shaped recorded reason is refused" "$(grep -c '^why:' "$NOTE/argv" || true)" "0"
+eq "the rest of the message still goes out" \
+  "$(grep -c -- '---CALL---' "$NOTE/argv" || true)" "1"
+
+# THE PHASE'S EXIT CODE IS STILL THE STEP'S EXIT CODE. main() streams the phase's
+# stderr through tee to capture the reason; that must not swallow the status, and
+# a phase that succeeds must record nothing. Run the real thing as a program
+# against a repository that cannot be opened, with no notifier in sight.
+CAPRUN=$NOTE/run
+mkdir -p "$CAPRUN"
+rc=0
+BASE="$CAPRUN/base" RESTIC_REPOSITORY="$CAPRUN/not-a-repository" RESTIC_PASSWORD=x \
+  DAG_RUN_ID=caprun bash "$RUNNER" check >"$CAPRUN/out" 2>&1 || rc=$?
+eq "a failing phase still exits non-zero through the capture" "$rc" "1"
+if [[ -f $CAPRUN/base/state/last_failure ]] &&
+   grep -q '^reason=Fatal: repository does not exist' "$CAPRUN/base/state/last_failure"; then
+  pass "the failing phase recorded its reason for the fail container"
+else
+  fail "the failing phase recorded no reason ($(tr '\n' '|' < "$CAPRUN/out"))"
+fi
+if grep -q 'recorded failure reason for check' "$CAPRUN/out"; then
+  pass "the reason is also in the log"
+else
+  fail "the reason is not in the log"
 fi
 
 # ---------------------------------------------------------------------------

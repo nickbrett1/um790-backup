@@ -87,6 +87,15 @@ only part of `prune` that can lose data. So the gate drives the real code:
 It reads `RESTIC_KEEP_ARGS` from the runner rather than restating it, so changing
 the policy without thinking about its effect fails the gate.
 
+- the failure message's contract: the phase named in the title, the job named in
+  the body (`restic backup of /srv on ryzen`), the failing tool's own error line
+  when one was captured and **no `why:` line at all** when one was not, a
+  secret-shaped reason dropped rather than printed, and the snapshot claim
+  derived from the phase order (check/snapshot/prune/status happen *after* the
+  backup, so they say the snapshot exists; the earlier phases say it does not; an
+  unknown phase says nothing). It also pins that one run posts exactly one
+  message and that the phase's exit code survives the stderr capture.
+
 - `do_check`'s lock handling — that `restic unlock` runs **before** `restic
   check`, that check carries `--retry-lock`, and that the unlock never uses
   `--remove-all`. The order is the part that matters: `check` needs an
@@ -276,6 +285,27 @@ NTFY_URL=
 Plus the NAS block (`RESTIC_REPOSITORY`, `NAS_HOST`, `NAS_PORT`, `NAS_USER`),
 the per-run `DAG_RUN_ID`, and `MAX_SOURCE_GB` — all documented with real
 defaults in `.env.example`.
+
+`NTFY_URL` is best-effort by design: the heartbeat and the lock release happen
+before the notification is attempted, so a dead topic costs the message and
+nothing else. What a failure message says, and why:
+
+```
+um790 backup FAILED: check
+restic backup of /srv on ryzen — restic repository check failed
+why: unable to create lock in backend: repository is already locked by PID 532492 ...
+safe: this run's snapshot is in the repository
+run 034pwBQBikAhf43qxfM06p
+```
+
+The body is deliberately ~300 characters of plain text. The `why:` line is the
+failing tool's last error, captured from the phase's stderr: each phase writes
+an already-scrubbed, length-capped copy to `/srv/.um790-backup/state/last_failure`
+and the `fail` container — a *different* container — reads it, keyed on
+`DAG_RUN_ID`. That file is why the reason does not have to travel through the
+wrapper's `docker run` argv. It is excluded from the backup, consumed by the
+message it belongs to, and cleared by `preflight`, so a reason can never be
+attached to a later run. Never pass a reason to a container as `-e VAR=value`.
 
 Retention knobs are read by the runner and default to the documented contract;
 set them only to deviate from it. `SNAPSHOT_RETENTION_WEEKS` (default 8) is the

@@ -190,8 +190,8 @@ SQLITE_DBS=(
   "/srv/docker/phoenix/data/phoenix.db|phoenix"
   "/srv/docker/open-webui/data/webui.db|open-webui"
   "/srv/docker/pihole/config/pihole-FTL.db|pihole-ftl"
-  "/srv/docker/mailroom/data/mailroom.db|mailroom"
-  "/srv/docker/mailroom/data/dagster/history/runs/index.db|dagster-history"
+  "/srv/docker/game-catalog/data/mailroom.db|mailroom"
+  "/srv/docker/game-catalog/data/dagster/history/runs/index.db|dagster-history"
   "/srv/appdata/reader/vg-books/reader.db|vg-books"
   "/srv/docker/potato/project/project.sqlite|potato"
   "/srv/docker/n8n/data/database.sqlite|n8n"
@@ -261,7 +261,7 @@ SQLITE_DBS=(
 # size but different sha256, mtime ~58.7 days older than mailroom.db, nothing
 # holding either open.
 STATIC_SQLITE=(
-  "/srv/docker/mailroom/backups/mailroom_pre_*.db"
+  "/srv/docker/game-catalog/backups/mailroom_pre_*.db"
 )
 
 # The exemption's whole justification is "nothing is writing to it", and that can

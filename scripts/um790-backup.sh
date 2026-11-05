@@ -196,7 +196,31 @@ SQLITE_DBS=(
   "/srv/docker/potato/project/project.sqlite|potato"
   "/srv/docker/n8n/data/database.sqlite|n8n"
   "/srv/docker/vikunja/db/vikunja.db|vikunja"
+  "/srv/appdata/msgvault/vectors.db|msgvault-vectors"
 )
+#
+# msgvault-vectors was added on 2026-11-04 by the drift guard itself: msgvault's
+# embedding index (vectors.db, 997M-1.0G) is new since the previous backup and
+# crossed the 10M threshold, so the 03:30 run died on "undiscovered SQLite >10M".
+#
+# It IS derived data — the vectors can be rebuilt from msgvault.db — and on that
+# argument it could have been excluded instead. It is dumped because the rebuild
+# is not free: a full re-embed of the corpus costs ~$15 of Cohere API credit and
+# about an hour of wall clock, which is a worse night than restoring a dump. That
+# is a deliberate, recorded cost decision, not an accident: if the embedding model
+# or its dimension ever change, the generation fingerprint invalidates the whole
+# index anyway and the choice is worth revisiting.
+#
+# It is LIVE, not frozen: the msgvault daemon holds it open with a WAL and writes
+# to it on every sync (embedding new arrivals). So SQLITE_DBS is the correct arm
+# and STATIC_SQLITE is explicitly wrong — a raw restic copy would catch it
+# mid-transaction. Like mailroom.db and dagster-history it usually has no -wal
+# while the embedding worker is idle, so expect the staged-copy fallback and its
+# nightly WARNING; that WARNING is the designed path, not damage.
+#
+# Size: this is the largest single member of SQLITE_DBS by an order of magnitude.
+# Staging holds the VACUUM INTO copy (~1.0G) on top of the source, so the dumps
+# phase's free-space check is the thing to watch if /srv/.um790-backup gets tight.
 #
 # msgvault and vg-books were REPOINTED to /srv/appdata/... (from /srv/msgvault
 # and /srv/reader) when the host's service data trees moved under /srv/appdata.

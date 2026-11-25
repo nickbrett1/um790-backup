@@ -197,7 +197,31 @@ SQLITE_DBS=(
   "/srv/docker/n8n/data/database.sqlite|n8n"
   "/srv/docker/vikunja/db/vikunja.db|vikunja"
   "/srv/appdata/msgvault/vectors.db|msgvault-vectors"
+  "/srv/appdata/data-download/data-download.db|data-download"
 )
+#
+# data-download was added on 2026-11-25 by the drift guard itself: the container's
+# state database crossed the 10M threshold (11,620,352B) and the 03:30 run died with
+# "undiscovered SQLite >10M ... add it to SQLITE_DBS if it is live".
+#
+# It IS live, and the other two arms were each plausible at a glance, so the
+# reasoning is recorded: the data-download container (127.0.0.1:8820) mounts
+# /srv/appdata/data-download at /data, keeps this file in WAL, and had a 4.1MB -wal
+# beside it with an mtime minutes before the scan. It is therefore NOT a
+# STATIC_SQLITE candidate — a raw restic copy would catch it mid-transaction — and it
+# must not be excluded: `events` is the pipeline's download history (44,293 rows on
+# 2026-11-25), the record of what was fetched and when, not rebuildable state like
+# msgvault's vectors.
+#
+# Pre-verified against the live file before pinning, the way contact with real state
+# has caught every defect in this list: an online .backup under active readers, then
+# VACUUM INTO — 11,341,824B out, `integrity_check ok`, all five tables present
+# (events, requests, dataset_catalogue, driver_jobs, sqlite_sequence).
+#
+# WAL caveat, same shape as mailroom and dagster-history: the writer is idle
+# overnight, so there is usually no -wal at 03:30 and this entry takes the
+# staged-copy fallback and logs its nightly WARNING. That WARNING is the designed
+# path, not damage.
 #
 # msgvault-vectors was added on 2026-11-04 by the drift guard itself: msgvault's
 # embedding index (vectors.db, 997M-1.0G) is new since the previous backup and

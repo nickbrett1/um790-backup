@@ -17,18 +17,48 @@ This project includes the following capabilities:
 
 ## Setup
 
+A shell project has nothing to install: the deliverable is a script plus the CLI
+tools it calls. This is a **batch** workload, not a service - one invocation runs
+one phase and exits, and Dagu on the host sequences the phases.
+
 1. Clone the repository
-2. Install dependencies:
+2. Put the secrets in place (see **Doppler** below), because the phases read them
+   from the environment:
 
    ```bash
-   npm install
+   doppler setup --project common --config dev
    ```
 
-3. Run the dev server:
+3. Run the **one-time host setup on the um790 host**, not inside the container.
+   It creates the identities the container mounts, pins the NAS host key on port
+   2222, installs the two public keys, and initialises the restic repository if
+   it is empty:
 
    ```bash
-   npm run dev
+   scripts/bootstrap.sh --check   # report every gap, change nothing
+   scripts/bootstrap.sh           # all steps, in order
    ```
+
+   Re-run `--check` whenever you like: it exits 1 at the first gap. The
+   `nas-keys` step prompts for the NAS password once by design - that prompt is
+   the root of trust, and no script can stand in for it. Steps are order-
+   dependent: `known-hosts` before any strict `ssh`, and `nas-keys` before
+   `repo`.
+
+4. Run a phase. Start with `--dry-run`, which validates the settings and exits 0
+   without opening the repository, touching `/srv` or contacting the NAS:
+
+   ```bash
+   scripts/um790-backup.sh --dry-run
+   scripts/um790-backup.sh preflight
+   ```
+
+   Phases, **one per invocation**: `preflight config dumps backup check snapshot
+   prune status fail`. Every phase is safe to run by hand during an incident -
+   the guards that matter deliberately do not live only inside the scheduler.
+
+In production the phases run from the published image under Dagu, not from this
+checkout. See `deploy/README.md`.
 
 ## Secret scanning
 

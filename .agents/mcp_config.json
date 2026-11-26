@@ -9,13 +9,6 @@
     "vikunja": {
       "serverUrl": "http://nas:8086/"
     },
-    "chrome-devtools": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "chrome-devtools-mcp"
-      ]
-    },
     "fintechnick": {
       "command": "sh",
       "args": [

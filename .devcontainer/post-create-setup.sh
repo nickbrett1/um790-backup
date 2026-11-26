@@ -316,14 +316,6 @@ fi
 
 echo "INFO: goose configuration complete."
 
-
-
-if ! pgrep -f "socat TCP-LISTEN:9222" > /dev/null; then
-    echo "Setup bridget to access Chrome DevTools Protocol over a secure tunnel..."
-    sudo start-stop-daemon --start --background --pidfile /var/run/socat-9222.pid --make-pidfile --chuid $(id -un):$(id -gn) --exec /usr/bin/socat -- TCP-LISTEN:9222,fork,bind=127.0.0.1 TCP:host.docker.internal:9222
-fi
-
-
 echo "INFO: Checking Tailscale status..."
 if ! command -v tailscale &> /dev/null; then
     echo "INFO: Installing Tailscale..."
